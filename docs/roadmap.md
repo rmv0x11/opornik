@@ -39,6 +39,16 @@
 - 🔜 Реальные вероятности из сети → точные решения по кубу: live-cube (Janowski)
   и таблица match equity (MWC) для матчевых удвоений (заменяют пороговую модель)
 
+## Деплой
+
+- ✅ **Живой сайт: https://rmv0x11.github.io/opornik/** (GitHub Pages, ветка `gh-pages`).
+  Проверено в реальном браузере: движок грузится из WASM, игра идёт, ошибок нет.
+- Передеплой: `cd web && npm run build`, затем запушить `web/dist` в ветку `gh-pages`
+  (с `.nojekyll`). Vite `base=/opornik/`.
+- Авто-деплой через GitHub Actions (`.github/workflows/deploy.yml` готов локально) —
+  требует токен со scope `workflow`: `gh auth refresh -h github.com -s workflow`,
+  затем закоммитить воркфлоу; после этого деплой по push в `main`.
+
 ## Фаза 2 — Игра в браузере
 
 - ✅ `engine-wasm` (wasm-bindgen) — крейт-обёртка, веса вшиты, Engine API (JSON);

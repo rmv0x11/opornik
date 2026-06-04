@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine-core", "crates/engine-train", "crates/engine-wasm"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["rmv0x11"]
+repository = "https://github.com/rmv0x11/opornik"
+rust-version = "1.80"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,18 @@
+[package]
+name = "engine-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Long Nardy (длинные нарды / FSNR rules) engine: board model, legal move generation, evaluation and baseline AI."
+
+[lib]
+# Keep the crate name importable as `engine_core`.
+name = "engine_core"
+
+[dependencies]
+# Intentionally dependency-free: the rules core must compile to native AND wasm32
+# without pulling std-only or platform-specific crates. RNG, serialization and the
+# neural net live in separate crates layered on top of this one.
+
+[dev-dependencies]

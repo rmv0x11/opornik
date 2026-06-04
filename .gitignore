@@ -1,0 +1,41 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / web
+node_modules/
+dist/
+.svelte-kit/
+*.local
+
+# Python / training
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.onnx
+*.npz
+checkpoints/
+
+# Engine artifacts
+*.bin.weights
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+
+# Trained model artifacts (keep the shipped champion net — bundled into the wasm)
+/models/*
+!/models/nardy-net.bin
+net.bin
+
+# web generated
+/web/src/engine/pkg/
+
+# nodejs verification pkg
+/crates/engine-wasm/pkg-node/
+/web/dist/
+test-results/
+playwright-report/

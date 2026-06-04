@@ -1,0 +1,17 @@
+[package]
+name = "engine-train"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Self-play TD training and benchmarking for the long-nardy engine net."
+
+[lib]
+name = "engine_train"
+
+[[bin]]
+name = "engine-train"
+path = "src/main.rs"
+
+[dependencies]
+engine-core = { path = "../engine-core" }

@@ -139,7 +139,7 @@
       };
     }
     if (!act) return;
-    const t = setTimeout(act, 700);
+    const t = setTimeout(act, 350);
     return () => clearTimeout(t);
   });
   function snap(p: PositionDto): PositionDto {
@@ -454,14 +454,6 @@
       /* ignore */
     }
   }
-  function resetDiceStats() {
-    diceStats = [0, 0, 0, 0, 0, 0, 0];
-    try {
-      localStorage.removeItem(DICE_KEY);
-    } catch {
-      /* ignore */
-    }
-  }
   const diceTotal = $derived(diceStats.reduce((a, b) => a + b, 0));
   // Largest deviation of any face from the ideal 1/6 (a quick fairness read-out).
   const diceMaxDev = $derived.by(() => {
@@ -470,6 +462,64 @@
     for (let f = 1; f <= 6; f++) m = Math.max(m, Math.abs(diceStats[f] / diceTotal - 1 / 6));
     return m * 100;
   });
+
+  // ---- куши (combination counts) + roll sequence ----
+  // kushStats: count per unordered combination "lo-hi" (persisted, like the faces).
+  // rollSeq: the chronological list of throws with who rolled (session-only — it
+  // grows unbounded, so it isn't persisted).
+  const KUSH_KEY = 'opornik.kushStats';
+  function loadKush(): Record<string, number> {
+    try {
+      const r = localStorage.getItem(KUSH_KEY);
+      if (r) {
+        const o = JSON.parse(r);
+        if (o && typeof o === 'object' && !Array.isArray(o)) return o as Record<string, number>;
+      }
+    } catch {
+      /* ignore */
+    }
+    return {};
+  }
+  let kushStats = $state<Record<string, number>>(loadKush());
+  let rollSeq = $state<{ who: 'you' | 'opp'; a: number; b: number; opening?: boolean }[]>([]);
+  let diceTab = $state<'faces' | 'kush' | 'seq'>('faces');
+  // The 21 distinct combinations, in order (1-1,1-2,…,1-6,2-2,…,6-6).
+  const KUSH_COMBOS: [number, number][] = (() => {
+    const out: [number, number][] = [];
+    for (let a = 1; a <= 6; a++) for (let b = a; b <= 6; b++) out.push([a, b]);
+    return out;
+  })();
+  function kushKey(a: number, b: number) {
+    return `${Math.min(a, b)}-${Math.max(a, b)}`;
+  }
+  // Record one throw (a pair) by `who`. Per-die fairness counts are bumped in
+  // rollDie; this adds the combination + sequence.
+  function recordRoll(who: 'you' | 'opp', a: number, b: number, opening = false) {
+    rollSeq = [...rollSeq, { who, a, b, opening }];
+    const k = kushKey(a, b);
+    kushStats[k] = (kushStats[k] ?? 0) + 1;
+    try {
+      localStorage.setItem(KUSH_KEY, JSON.stringify(kushStats));
+    } catch {
+      /* ignore */
+    }
+  }
+  const kushTotal = $derived(Object.values(kushStats).reduce((s, n) => s + n, 0));
+  const doublesCount = $derived(
+    [1, 2, 3, 4, 5, 6].reduce((n, f) => n + (kushStats[`${f}-${f}`] ?? 0), 0),
+  );
+
+  function resetDiceStats() {
+    diceStats = [0, 0, 0, 0, 0, 0, 0];
+    kushStats = {};
+    rollSeq = [];
+    try {
+      localStorage.removeItem(DICE_KEY);
+      localStorage.removeItem(KUSH_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
   // Signed equity, e.g. +0.412 / −0.683 (− is a real minus glyph for alignment).
   function fmtEq(e: number): string {
     return (e >= 0 ? '+' : '−') + Math.abs(e).toFixed(3);
@@ -692,6 +742,7 @@
     status = `Вы: ${you} · соперник: ${opp}`;
     await delay(1100); // let the player read the dice
     const humanFirst = you > opp;
+    recordRoll(humanFirst ? 'you' : 'opp', you, opp, true); // opening pair (played by the higher roller)
     try {
       // ФСНР: the first move is played with the two dice that just came up (one
       // from each player); the higher roller goes first — there is NO re-roll.
@@ -944,6 +995,7 @@
     try {
       const d1 = rollDie(),
         d2 = rollDie();
+      recordRoll('you', d1, d2);
       await engine.setDice(d1, d2);
       await enterHumanMove(d1, d2);
     } catch (e) {
@@ -1082,6 +1134,7 @@
   async function aiRoll(preset?: [number, number]) {
     const d1 = preset ? preset[0] : rollDie();
     const d2 = preset ? preset[1] : rollDie();
+    if (!preset) recordRoll('opp', d1, d2); // preset = opening, already recorded
     const before = pos;
     await engine.setDice(d1, d2);
     pos = await engine.getPosition(); // reflect the dice on the board first
@@ -1544,35 +1597,78 @@
             aria-expanded={fairOpen}
             onclick={() => (fairOpen = !fairOpen)}
           >
-            🎲 Честность костей ({diceTotal})
+            🎲 Кости — статистика ({diceTotal})
             <span class="gl-caret">{fairOpen ? '▾' : '▸'}</span>
           </button>
           {#if fairOpen}
             <div class="fairbody">
-              <p class="fairnote">
-                Кости — из криптогенератора (<code>crypto.getRandomValues</code>) с
-                rejection-sampling: каждая грань строго 1/6 (16.7%), источник
-                непредсказуем. Считаются все броски — ваши и движка.
-              </p>
-              <ol class="facebars">
-                {#each [1, 2, 3, 4, 5, 6] as f}
-                  {@const cnt = diceStats[f]}
-                  {@const pct = diceTotal ? (cnt / diceTotal) * 100 : 0}
-                  <li>
-                    <span class="face">{f}</span>
-                    <span class="bar"
-                      ><span class="barfill" style="width: {Math.min(100, (pct / 33) * 100)}%"
-                      ></span></span
-                    >
-                    <span class="cnt">{cnt}</span>
-                    <span class="pct">{pct.toFixed(1)}%</span>
-                  </li>
-                {/each}
-              </ol>
-              <div class="fairfoot">
-                <span class="fairdev">макс. отклонение от 16.7%: {diceMaxDev.toFixed(1)}%</span>
-                <button type="button" class="ghost" onclick={resetDiceStats}>Сбросить</button>
+              <div class="dicetabs">
+                <button type="button" class:active={diceTab === 'faces'} onclick={() => (diceTab = 'faces')}>Грани</button>
+                <button type="button" class:active={diceTab === 'kush'} onclick={() => (diceTab = 'kush')}>Куши</button>
+                <button type="button" class:active={diceTab === 'seq'} onclick={() => (diceTab = 'seq')}>Последовательность</button>
               </div>
+
+              {#if diceTab === 'faces'}
+                <p class="fairnote">
+                  Кости — из криптогенератора (<code>crypto.getRandomValues</code>) с
+                  rejection-sampling: каждая грань строго 1/6 (16.7%), источник
+                  непредсказуем. Считаются все кости — ваши и движка.
+                </p>
+                <ol class="facebars">
+                  {#each [1, 2, 3, 4, 5, 6] as f}
+                    {@const cnt = diceStats[f]}
+                    {@const pct = diceTotal ? (cnt / diceTotal) * 100 : 0}
+                    <li>
+                      <span class="face">{f}</span>
+                      <span class="bar"
+                        ><span class="barfill" style="width: {Math.min(100, (pct / 33) * 100)}%"
+                        ></span></span
+                      >
+                      <span class="cnt">{cnt}</span>
+                      <span class="pct">{pct.toFixed(1)}%</span>
+                    </li>
+                  {/each}
+                </ol>
+                <div class="fairfoot">
+                  <span class="fairdev">макс. отклонение от 16.7%: {diceMaxDev.toFixed(1)}%</span>
+                  <button type="button" class="ghost" onclick={resetDiceStats}>Сбросить</button>
+                </div>
+              {:else if diceTab === 'kush'}
+                <p class="fairnote">
+                  Сколько раз выпала каждая комбинация ({kushTotal} бросков, из них
+                  дублей {doublesCount}). Ожидаемо: пара ≈ 5.6%, дубль ≈ 2.8%.
+                </p>
+                <ol class="kushgrid">
+                  {#each KUSH_COMBOS as [a, b]}
+                    {@const cnt = kushStats[`${a}-${b}`] ?? 0}
+                    {@const pct = kushTotal ? (cnt / kushTotal) * 100 : 0}
+                    <li class:dbl={a === b} title="{pct.toFixed(1)}%">
+                      <span class="kk">{a}-{b}</span>
+                      <span class="kc">{cnt}</span>
+                    </li>
+                  {/each}
+                </ol>
+                <div class="fairfoot">
+                  <span class="fairdev">всего: {kushTotal} · дублей: {doublesCount}</span>
+                  <button type="button" class="ghost" onclick={resetDiceStats}>Сбросить</button>
+                </div>
+              {:else}
+                <p class="fairnote">Последовательность бросков этой сессии (новые сверху).</p>
+                {#if rollSeq.length === 0}
+                  <p class="seq-empty">Бросков пока нет.</p>
+                {:else}
+                  <ol class="rollseq">
+                    {#each [...rollSeq].reverse() as r, i}
+                      <li class="seqrow" class:me={r.who === 'you'} class:dbl={r.a === r.b}>
+                        <span class="sn">{rollSeq.length - i}</span>
+                        <span class="swho">{r.who === 'you' ? 'вы' : 'движок'}</span>
+                        <span class="sdice">{r.a}-{r.b}{r.a === r.b ? ' ⚡' : ''}</span>
+                        {#if r.opening}<span class="sopen">розыгрыш</span>{/if}
+                      </li>
+                    {/each}
+                  </ol>
+                {/if}
+              {/if}
             </div>
           {/if}
         </div>
@@ -2290,6 +2386,110 @@
   .fairdev {
     font-size: 0.76rem;
     color: var(--ink-faint);
+  }
+  /* dice-stats tabs */
+  .dicetabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-bottom: 0.55rem;
+  }
+  .dicetabs button {
+    cursor: pointer;
+    padding: 0.28rem 0.65rem;
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    color: var(--ink-muted);
+    font: var(--fw-semi) 0.78rem var(--font-ui);
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .dicetabs button:hover {
+    background: var(--surface-raised);
+  }
+  .dicetabs button.active {
+    background: linear-gradient(180deg, var(--btn-primary-hi), var(--btn-primary));
+    color: #fff;
+    border-color: var(--btn-primary);
+  }
+  /* куши grid */
+  .kushgrid {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(3.6rem, 1fr));
+    gap: 0.3rem;
+    font: 0.82rem var(--font-mono);
+    font-variant-numeric: var(--num-tabular);
+  }
+  .kushgrid li {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.4rem;
+    white-space: nowrap;
+    padding: 0.22rem 0.45rem;
+    background: var(--surface-sunken);
+    border-radius: var(--radius-sm);
+  }
+  .kushgrid li.dbl {
+    background: #f3e6c8;
+    box-shadow: inset 0 0 0 1px #e0c98a;
+  }
+  .kushgrid .kk {
+    font-weight: 700;
+    color: #6b4423;
+  }
+  .kushgrid .kc {
+    color: #3a2e1c;
+    font-weight: 600;
+  }
+  /* roll sequence */
+  .seq-empty {
+    color: var(--ink-faint);
+    font-size: 0.82rem;
+  }
+  .rollseq {
+    list-style: none;
+    margin: 0;
+    padding: 0 0.2rem 0.2rem 0;
+    max-height: clamp(180px, 40dvh, 320px);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    font: 0.84rem var(--font-mono);
+    font-variant-numeric: var(--num-tabular);
+  }
+  .seqrow {
+    display: grid;
+    grid-template-columns: 2.2rem 3.4rem 1fr auto;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.22rem 0.3rem;
+    border-bottom: 1px dotted #e8dcc6;
+  }
+  .seqrow .sn {
+    color: #aaa;
+    text-align: right;
+  }
+  .seqrow .swho {
+    color: #6b4423;
+  }
+  .seqrow.me .swho {
+    font-weight: 700;
+  }
+  .seqrow .sdice {
+    color: #2c2c2c;
+  }
+  .seqrow.dbl .sdice {
+    color: #9a6a16;
+    font-weight: 700;
+  }
+  .seqrow .sopen {
+    color: #a08a6a;
+    font-size: 0.72rem;
+    font-style: italic;
   }
   .gl-head {
     display: flex;

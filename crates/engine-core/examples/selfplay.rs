@@ -81,6 +81,7 @@ fn main() {
                 game.turn_number
             );
         }
+        Outcome::Draw => println!("Result: draw (ничья)"),
         Outcome::Ongoing => println!("Result: unfinished (turn cap reached)"),
     }
 }

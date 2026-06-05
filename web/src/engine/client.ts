@@ -4,9 +4,11 @@
 import type {
   BestMoveDto,
   CubeDecisionDto,
+  PlayerColor,
   PositionDto,
   ProbabilitiesDto,
   RankedTurnDto,
+  SequenceDto,
   SetupDto,
   TurnDto,
 } from './types';
@@ -47,6 +49,9 @@ class EngineClient {
   legalTurns() {
     return this.call<TurnDto[]>('legalTurns');
   }
+  legalSequences() {
+    return this.call<SequenceDto[]>('legalSequences');
+  }
   applyTurn(id: number) {
     return this.call<PositionDto>('applyTurn', { id });
   }
@@ -72,13 +77,18 @@ class EngineClient {
     return this.call<PositionDto>('beaver');
   }
   setPosition(setup: SetupDto) {
-    return this.call<PositionDto>('setPosition', { setup });
+    // Strip any Svelte $state proxies so the object is structured-cloneable
+    // across the worker boundary.
+    return this.call<PositionDto>('setPosition', { setup: JSON.parse(JSON.stringify(setup)) });
   }
   getPosition() {
     return this.call<PositionDto>('getPosition');
   }
   reset() {
     return this.call<PositionDto>('reset');
+  }
+  setTurn(color: PlayerColor) {
+    return this.call<PositionDto>('setTurn', { color });
   }
   setCrawford(on: boolean) {
     return this.call<PositionDto>('setCrawford', { on });

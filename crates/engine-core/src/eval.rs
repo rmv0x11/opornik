@@ -56,6 +56,9 @@ pub fn evaluate(board: &Board, player: Player) -> f32 {
             let sign = if winner == player { 1.0 } else { -1.0 };
             return sign * (WIN_SCORE + points as f32);
         }
+        // board-only `outcome` never yields Draw (needs game state), but the match
+        // must stay exhaustive; treat as neutral.
+        Outcome::Draw => return 0.0,
         Outcome::Ongoing => {}
     }
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { engine } from '../../engine/client';
   import type {
     CheckerMoveDto,
@@ -7,28 +7,35 @@
     PlayerColor,
     PositionDto,
     RankedTurnDto,
+    SequenceDto,
     TurnDto,
     VariantId,
   } from '../../engine/types';
   import Board from '../board/Board.svelte';
   import { phys, posOfPhys } from '../board/coords';
+  import { exportGame, newId, saveGame, type SavedGame } from '../storage';
 
   let {
     variant,
     aiPly,
     humanColor,
     matchLength,
+    resume = null,
+    boardStyle = '',
     onExit,
   }: {
     variant: VariantId;
     aiPly: number;
     humanColor: PlayerColor;
     matchLength: number | null;
+    resume?: SavedGame | null;
+    boardStyle?: string;
     onExit: () => void;
   } = $props();
 
   type Phase =
     | 'loading'
+    | 'openingRoll'
     | 'humanRoll'
     | 'rolling'
     | 'humanMove'
@@ -38,16 +45,81 @@
     | 'error';
 
   let pos = $state<PositionDto | null>(null);
-  let legal = $state<TurnDto[]>([]);
+  let legal = $state<TurnDto[]>([]); // deduped legal turns (move list / analysis / AI)
+  let sequences = $state<SequenceDto[]>([]); // every legal ordering (drives move-building)
   let phase = $state<Phase>('loading');
   let status = $state('Загрузка…');
   let humanWin = $state(0.5);
+  let displayWin = $state(0.5); // eased count-up of humanWin (bar + label tick together)
+  $effect(() => {
+    const target = humanWin;
+    const start = untrack(() => displayWin);
+    const reduce =
+      typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || Math.abs(target - start) < 0.005) {
+      displayWin = target;
+      return;
+    }
+    const t0 = performance.now();
+    const dur = 420;
+    let raf = requestAnimationFrame(function step(now) {
+      const k = Math.min(1, (now - t0) / dur);
+      displayWin = start + (target - start) * (1 - Math.pow(1 - k, 3)); // ease-out cubic
+      if (k < 1) raf = requestAnimationFrame(step);
+    });
+    return () => cancelAnimationFrame(raf);
+  });
   let ranked = $state<RankedTurnDto[] | null>(null);
   let cubeDec = $state<CubeDecisionDto | null>(null);
   let analyzing = $state(false);
   let pending = $state<CheckerMoveDto[]>([]); // sub-moves chosen so far this turn
   let selSource = $state<number | null>(null); // selected source (mover path pos)
   let lastCells = $state<number[]>([]); // physical cells touched by the last move (pulse)
+  let glide = $state<{ from: number; to: number; color: PlayerColor; bearOff?: boolean } | null>(
+    null,
+  );
+  let animating = $state(false);
+  let aiLast = $state<{ d1: number; d2: number; moves: string } | null>(null); // comp's last roll+move
+  let openRoll = $state<{ you: number; opp: number } | null>(null); // opening roll for first move
+
+  // ---- game log: every played turn with its evaluation ----
+  type LogEntry = {
+    n: number; // turn number
+    color: PlayerColor; // who moved
+    dice: [number, number] | null;
+    notation: string;
+    win: number | null; // win% from the mover's perspective
+    loss: number | null; // equity lost vs the best move (null = not scored)
+    before: PositionDto; // board state before this move (to review / replay)
+    ranked: RankedTurnDto[] | null; // alternative moves with evaluations (human moves)
+    isHuman: boolean; // whether this was the human's move (replayable)
+  };
+  let history = $state<LogEntry[]>([]);
+  let reviewIdx = $state<number | null>(null); // which log entry is expanded for review
+  let logOpen = $state(true); // game-log panel expanded (plain div, not <details>, so
+  // its scroll container flexes reliably — <details> wraps content in a box that
+  // breaks flex-based internal scrolling)
+  function snap(p: PositionDto): PositionDto {
+    return JSON.parse(JSON.stringify(p));
+  }
+  // severity of a move from its equity loss (human moves only)
+  function sev(loss: number | null): '' | 'ok' | 'inacc' | 'blunder' {
+    if (loss == null) return '';
+    if (loss < 0.02) return 'ok';
+    if (loss <= 0.08) return 'inacc';
+    return 'blunder';
+  }
+  function evalLabel(h: LogEntry): string {
+    if (h.loss == null) return h.win != null ? `${(h.win * 100).toFixed(0)}%` : '';
+    if (h.loss < 0.0005) return '✓ лучший';
+    const s = sev(h.loss);
+    const word = s === 'blunder' ? 'ошибка' : s === 'inacc' ? 'неточность' : '';
+    return `−${h.loss.toFixed(3)}${word ? ' · ' + word : ''}`;
+  }
+
+  const ANIM_MS = 300; // matches the board glide (pick-up → travel → settle)
+  const BEAR_MS = 440; // bear-off arc into the tray
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   let matchScore = $state<[number, number]>([0, 0]); // [human, ai] points
   let crawfordPlayed = $state(false);
   let currentGameCrawford = $state(false);
@@ -80,55 +152,129 @@
   }
 
   // ---- click-to-move: build a turn sub-move by sub-move ----
-  // A sub-move is identified by (from→to) (to=0 = bear off). The partial selection
-  // is matched against the legal turns by sub-move multiset; once the multiset
-  // equals a full legal turn, that turn is committed.
-  function moveKey(m: CheckerMoveDto) {
-    return `${m.from}-${m.to}`;
+  // Move-building is driven by the engine's legal *ordered* sequences (every legal
+  // ordering, each legal at every intermediate step — head rule, blocked landings,
+  // the transient full-prime ban and the bear-off over-roll rule are all enforced
+  // by the generator). The player's chosen sub-moves (`pending`) are matched as an
+  // ordered PREFIX of those sequences; the legal next sub-moves are whatever comes
+  // next in any sequence that still matches. This replaces the old multiset match
+  // against the deduped turn list, which silently forbade some legal orderings
+  // (e.g. playing the smaller die first to reach the same square).
+  function sameMove(a: CheckerMoveDto, b: CheckerMoveDto) {
+    return a.from === b.from && a.die === b.die && a.to === b.to && a.bear_off === b.bear_off;
   }
-  function counts(moves: CheckerMoveDto[]): Map<string, number> {
-    const c = new Map<string, number>();
-    for (const m of moves) c.set(moveKey(m), (c.get(moveKey(m)) ?? 0) + 1);
-    return c;
-  }
-  function superset(big: Map<string, number>, small: Map<string, number>) {
-    for (const [k, v] of small) if ((big.get(k) ?? 0) < v) return false;
+  function isPrefix(seq: CheckerMoveDto[], p: CheckerMoveDto[]) {
+    if (seq.length < p.length) return false;
+    for (let i = 0; i < p.length; i++) if (!sameMove(seq[i], p[i])) return false;
     return true;
   }
-  function moverOcc(): Map<number, number> {
-    const m = new Map<number, number>();
-    if (pos) {
-      for (const p of humanColor === 'white' ? pos.white : pos.black) m.set(p.pos, p.count);
-    }
-    for (const h of pending) {
-      m.set(h.from, (m.get(h.from) ?? 0) - 1);
-      if (!h.bear_off && h.to > 0) m.set(h.to, (m.get(h.to) ?? 0) + 1);
-    }
-    return m;
+  function hopKey(m: CheckerMoveDto) {
+    return `${m.from}-${m.die}-${m.to}-${m.bear_off ? 1 : 0}`;
   }
-  const nextHops = $derived.by<CheckerMoveDto[]>(() => {
+  // The legal next single sub-moves given the sub-moves chosen so far (`p`).
+  function availableHops(p: CheckerMoveDto[]): CheckerMoveDto[] {
     if (phase !== 'humanMove') return [];
-    const pc = counts(pending);
-    const occ = moverOcc();
     const hops = new Map<string, CheckerMoveDto>();
-    for (const t of legal) {
-      const tc = counts(t.moves);
-      if (!superset(tc, pc)) continue;
-      const rem = new Map(tc);
-      for (const [k, v] of pc) rem.set(k, (rem.get(k) ?? 0) - v);
-      for (const mv of t.moves) {
-        const k = moveKey(mv);
-        if ((rem.get(k) ?? 0) > 0 && (occ.get(mv.from) ?? 0) > 0) hops.set(k, mv);
-      }
+    for (const s of sequences) {
+      if (s.moves.length <= p.length || !isPrefix(s.moves, p)) continue;
+      const nx = s.moves[p.length];
+      hops.set(hopKey(nx), nx);
     }
     return [...hops.values()];
-  });
+  }
+  const nextHops = $derived(availableHops(pending));
   const sourceCells = $derived(new Set(nextHops.map((h) => phys(humanColor, h.from))));
-  const destHops = $derived(selSource == null ? [] : nextHops.filter((h) => h.from === selSource));
-  const destCells = $derived(
-    destHops.filter((h) => !h.bear_off && h.to > 0).map((h) => phys(humanColor, h.to)),
+
+  // For the selected checker: every reachable landing cell → the chain of hops to
+  // reach it (so a single drag/click can play the FINAL square, using both dice).
+  const reachable = $derived.by<Map<number, CheckerMoveDto[]>>(() => {
+    const map = new Map<number, CheckerMoveDto[]>();
+    if (selSource == null) return map;
+    const visit = (cur: number, sim: CheckerMoveDto[], chain: CheckerMoveDto[], depth: number) => {
+      if (depth >= 4) return; // at most 4 dice (doubles)
+      for (const h of availableHops(sim)) {
+        if (h.bear_off || h.to <= 0 || h.from !== cur) continue;
+        const cell = phys(humanColor, h.to);
+        const next = [...chain, h];
+        if (!map.has(cell)) map.set(cell, next);
+        visit(h.to, [...sim, h], next, depth + 1);
+      }
+    };
+    visit(selSource, pending, [], 0);
+    return map;
+  });
+  const destCells = $derived([...reachable.keys()]);
+  // Chain (possibly multi-hop) that ends in bearing the selected checker off.
+  const bearOffChain = $derived.by<CheckerMoveDto[] | null>(() => {
+    if (selSource == null) return null;
+    const find = (
+      cur: number,
+      sim: CheckerMoveDto[],
+      chain: CheckerMoveDto[],
+      depth: number,
+    ): CheckerMoveDto[] | null => {
+      if (depth >= 4) return null;
+      const hops = availableHops(sim).filter((h) => h.from === cur);
+      const bo = hops.find((h) => h.bear_off);
+      if (bo) return [...chain, bo];
+      for (const h of hops) {
+        if (h.bear_off || h.to <= 0) continue;
+        const r = find(h.to, [...sim, h], [...chain, h], depth + 1);
+        if (r) return r;
+      }
+      return null;
+    };
+    return find(selSource, pending, [], 0);
+  });
+  // Physical cell of the selected checker when it can bear off (for swipe-up).
+  const bearOffCell = $derived(
+    selSource != null && bearOffChain ? phys(humanColor, selSource) : null,
   );
-  const bearOffHop = $derived(destHops.find((h) => h.bear_off) ?? null);
+
+  // Apply a list of sub-moves for `color` to a copy of `base` (purely visual).
+  function posWithMoves(
+    base: PositionDto,
+    color: PlayerColor,
+    moves: CheckerMoveDto[],
+  ): PositionDto {
+    const arr = color === 'white' ? base.white : base.black;
+    const m = new Map<number, number>();
+    for (const p of arr) m.set(p.pos, p.count);
+    let off = color === 'white' ? base.off[0] : base.off[1];
+    for (const h of moves) {
+      m.set(h.from, (m.get(h.from) ?? 0) - 1);
+      if (h.bear_off || h.to <= 0) off += 1;
+      else m.set(h.to, (m.get(h.to) ?? 0) + 1);
+    }
+    const points = [...m.entries()]
+      .filter(([, c]) => c > 0)
+      .map(([p, count]) => ({ pos: p, player: color, count }));
+    const next: PositionDto = { ...base };
+    if (color === 'white') {
+      next.white = points;
+      next.off = [off, base.off[1]];
+    } else {
+      next.black = points;
+      next.off = [base.off[0], off];
+    }
+    return next;
+  }
+
+  // Board shows the human turn as it's built (null = no pending → show `pos`).
+  const displayPos = $derived.by<PositionDto | null>(() =>
+    !pos || pending.length === 0 ? null : posWithMoves(pos, humanColor, pending),
+  );
+  // Intermediate board during the AI's animated move (null when not animating).
+  let aiAnim = $state<PositionDto | null>(null);
+
+  // The legal sequence the pending sub-moves exactly complete (if any) — and the
+  // deduped turn id it commits to via `play()`.
+  const completeSeq = $derived.by<SequenceDto | null>(() => {
+    if (phase !== 'humanMove' || pending.length === 0) return null;
+    return (
+      sequences.find((s) => s.moves.length === pending.length && isPrefix(s.moves, pending)) ?? null
+    );
+  });
 
   function clearMoveBuild() {
     pending = [];
@@ -136,48 +282,117 @@
   }
 
   function handlePointClick(cell: number) {
-    if (phase !== 'humanMove') return;
+    if (phase !== 'humanMove' || animating) return;
     const p = posOfPhys(humanColor, cell);
-    if (nextHops.some((h) => h.from === p)) {
-      selSource = selSource === p ? null : p;
+    // clicking the already-selected checker deselects it
+    if (selSource === p) {
+      selSource = null;
       return;
     }
-    if (selSource != null) {
-      const hop = nextHops.find((h) => h.from === selSource && !h.bear_off && h.to === p);
-      if (hop) {
-        applyHop(hop);
-        return;
-      }
+    // with a checker selected, a reachable target WINS — even when that point
+    // already holds your own checkers (stacking). This is the move-priority fix
+    // for "can't move a checker onto another checker".
+    if (selSource != null && reachable.has(cell)) {
+      void applyChain(reachable.get(cell)!, true);
+      return;
+    }
+    // otherwise (re)select a movable checker, or clear
+    if (nextHops.some((h) => h.from === p)) {
+      selSource = p;
+      return;
     }
     selSource = null;
   }
 
-  function applyHop(hop: CheckerMoveDto) {
-    pending = [...pending, hop];
-    const pc = counts(pending);
-    const done = legal.find((t) => t.moves.length === pending.length && superset(counts(t.moves), pc));
-    if (done) {
-      void play(done.id, true);
-      return;
+  // Drag release over a destination cell — play the full chain to the FINAL square
+  // (both dice in one gesture). The ghost already showed the motion, so no glide.
+  function onDrop(cell: number) {
+    if (phase !== 'humanMove' || animating || selSource == null) return;
+    if (reachable.has(cell)) void applyChain(reachable.get(cell)!, false);
+  }
+
+  // Apply a chain of sub-moves (one checker, one or more dice). Glides each hop
+  // when `animate`. NEVER auto-commits — the player confirms.
+  async function applyChain(hops: CheckerMoveDto[], animate: boolean) {
+    if (animating || hops.length === 0) return;
+    for (const h of hops) {
+      if (animate && h.bear_off) {
+        animating = true;
+        glide = { from: phys(humanColor, h.from), to: -1, color: humanColor, bearOff: true };
+        pending = [...pending, h];
+        await delay(BEAR_MS);
+        glide = null;
+        animating = false;
+      } else if (animate && h.to > 0) {
+        animating = true;
+        glide = { from: phys(humanColor, h.from), to: phys(humanColor, h.to), color: humanColor };
+        pending = [...pending, h];
+        await delay(ANIM_MS);
+        glide = null;
+        animating = false;
+      } else {
+        pending = [...pending, h];
+      }
     }
-    // keep the same checker selected if it can move again (smooth chaining)
-    selSource = hop.to > 0 && nextHops.some((h) => h.from === hop.to) ? hop.to : null;
+    // keep the checker selected if it can still move (smooth chaining), else clear
+    const last = hops[hops.length - 1];
+    selSource =
+      !last.bear_off && last.to > 0 && availableHops(pending).some((h) => h.from === last.to)
+        ? last.to
+        : null;
   }
 
   function bearOffSelected() {
-    if (bearOffHop) applyHop(bearOffHop);
+    if (bearOffChain) void applyChain(bearOffChain, true);
   }
   function undoPending() {
+    if (animating) return;
     pending = pending.slice(0, -1);
     selSource = null;
+  }
+  // Load a full turn from the list as a pending preview (player then confirms).
+  function previewTurn(t: TurnDto) {
+    if (animating) return;
+    pending = [...t.moves];
+    selSource = null;
+  }
+  function confirmMove() {
+    if (completeSeq) void play(completeSeq.turn_id, true);
   }
 
   function rollDie() {
     return 1 + Math.floor(Math.random() * 6);
   }
+  // Signed equity, e.g. +0.412 / −0.683 (− is a real minus glyph for alignment).
+  function fmtEq(e: number): string {
+    return (e >= 0 ? '+' : '−') + Math.abs(e).toFixed(3);
+  }
+  // Dot layout per die value (indices into a 3×3 grid) — for the AI-roll readout.
+  const PIPS: Record<number, number[]> = {
+    1: [4],
+    2: [0, 8],
+    3: [0, 4, 8],
+    4: [0, 2, 6, 8],
+    5: [0, 2, 4, 6, 8],
+    6: [0, 2, 3, 5, 6, 8],
+  };
+  // Render a turn, collapsing a single checker's chained sub-moves (24→20→14)
+  // into one segment (24/14) so it reads as ONE checker moving, not two.
   function fmtTurn(t: TurnDto): string {
     if (t.is_pass) return 'пропуск';
-    return t.moves.map((m) => (m.bear_off ? `${m.from}/выкид` : `${m.from}/${m.to}`)).join('  ');
+    const ms = t.moves;
+    const segs: string[] = [];
+    let i = 0;
+    while (i < ms.length) {
+      const start = ms[i].from;
+      let j = i;
+      // extend while the next sub-move continues the same checker (its source
+      // is this hop's destination), stopping at a bear-off
+      while (j + 1 < ms.length && !ms[j].bear_off && ms[j + 1].from === ms[j].to) j++;
+      segs.push(ms[j].bear_off ? `${start}/выкид` : `${start}/${ms[j].to}`);
+      i = j + 1;
+    }
+    return segs.join('  ');
   }
   function occArr(p: PositionDto): number[] {
     const o = new Array(24).fill(0);
@@ -199,9 +414,13 @@
   function fail(e: unknown) {
     status = `Ошибка: ${e instanceof Error ? e.message : String(e)}`;
     phase = 'error';
+    // never leave an animation overlay stuck on an error screen
+    aiAnim = null;
+    glide = null;
+    animating = false;
   }
   function isOver(p: PositionDto) {
-    return p.outcome.kind === 'win';
+    return p.outcome.kind === 'win' || p.outcome.kind === 'draw';
   }
   async function updateWin() {
     if (!pos) return;
@@ -228,8 +447,31 @@
   }
 
   function announceBoardWin(p: PositionDto) {
+    if (p.outcome.kind === 'draw') {
+      // Classic last-roll equalisation: both sides borne off — no points.
+      if (currentGameCrawford) crawfordPlayed = true;
+      status = `Ничья — обе стороны вывели все шашки${
+        matchLength != null ? ` (матч ${matchScore[0]}:${matchScore[1]})` : ''
+      }.`;
+      phase = 'over';
+      return;
+    }
     const points = (p.outcome.points ?? 1) * p.cube.value;
     finishGame(p.outcome.winner as PlayerColor, points, p.outcome.mars ? 'марс' : 'оин');
+  }
+
+  // Mars is impossible (so a single-point оин concession is allowed) only once the
+  // human has borne off at least one checker — until then they could still be marsed.
+  const canResignSingle = $derived(pos ? (humanColor === 'white' ? pos.off[0] : pos.off[1]) >= 1 : false);
+
+  // The human concedes the game: оин (1 pt) or марс (2 pt), times the cube.
+  function resign(mars: boolean) {
+    if (!pos || animating || (phase !== 'humanRoll' && phase !== 'humanMove')) return;
+    if (!mars && !canResignSingle) return; // оин only when mars is impossible
+    const points = (mars ? 2 : 1) * pos.cube.value;
+    clearAnalysis();
+    clearMoveBuild();
+    finishGame(aiColor, points, mars ? 'Сдача с марсом' : 'Сдача (оин)');
   }
 
   async function continueAfter() {
@@ -248,8 +490,82 @@
     }
   }
 
+  // Resume from a saved/imported game: restore the board + match context and
+  // pick the right phase to continue from.
+  async function resumeFrom(g: SavedGame) {
+    await engine.init(g.variant);
+    matchScore = [g.matchScore[0], g.matchScore[1]];
+    crawfordPlayed = g.crawfordPlayed;
+    pos = await engine.setPosition(g.setup);
+    currentGameCrawford = !!g.setup.crawford;
+    await updateWin();
+    if (isOver(pos)) {
+      announceBoardWin(pos);
+      return;
+    }
+    if (pos.turn === humanColor) {
+      if (pos.dice) {
+        await loadLegal();
+        clearMoveBuild();
+        if (legal.length === 1 && legal[0].is_pass) {
+          status = 'Ходов нет, пропуск.';
+          await play(legal[0].id, true);
+          return;
+        }
+        status = `Партия загружена. Кости ${pos.dice[0]}-${pos.dice[1]}: ваш ход.`;
+        phase = 'humanMove';
+        void analyze();
+      } else {
+        phase = 'humanRoll';
+        status = 'Партия загружена. Ваш ход — бросайте кости.';
+      }
+    } else {
+      await aiTurn();
+    }
+  }
+
+  // ---- opening roll: each side throws one die, higher goes first (ФСНР) ----
+  function startOpeningRoll() {
+    openRoll = null;
+    phase = 'openingRoll';
+    status = 'Розыгрыш первого хода: бросьте кость.';
+  }
+  async function doOpeningRoll() {
+    if (phase !== 'openingRoll' || openRoll) return;
+    let you = rollDie();
+    let opp = rollDie();
+    while (you === opp) {
+      // a tie can't decide the order → re-roll (only the order needs deciding)
+      you = rollDie();
+      opp = rollDie();
+    }
+    openRoll = { you, opp };
+    status = `Вы: ${you} · соперник: ${opp}`;
+    await delay(1100); // let the player read the dice
+    const humanFirst = you > opp;
+    try {
+      // ФСНР: the first move is played with the two dice that just came up (one
+      // from each player); the higher roller goes first — there is NO re-roll.
+      pos = await engine.setTurn(humanFirst ? humanColor : aiColor);
+      await engine.setDice(you, opp);
+      await updateWin();
+      if (humanFirst) {
+        await enterHumanMove(you, opp);
+      } else {
+        status = `Первым ходит соперник (кости ${you}-${opp})…`;
+        await aiRoll([you, opp]);
+      }
+    } catch (e) {
+      fail(e);
+    }
+  }
+
   onMount(async () => {
     try {
+      if (resume) {
+        await resumeFrom(resume);
+        return;
+      }
       pos = await engine.init(variant);
       currentGameCrawford = crawfordForNext();
       pos = await engine.setCrawford(currentGameCrawford);
@@ -258,16 +574,148 @@
         announceBoardWin(pos);
         return;
       }
-      if (pos.turn === humanColor) {
-        phase = 'humanRoll';
-        status = 'Ваш ход — бросайте кости.';
-      } else {
-        await aiTurn();
-      }
+      startOpeningRoll();
     } catch (e) {
       fail(e);
     }
   });
+
+  // ---- save / export the current game so it can be resumed later ----
+  let saveMsg = $state('');
+  let exportStr = $state('');
+  function defaultName(): string {
+    const sc =
+      matchLength != null
+        ? `матч ${matchScore[0]}:${matchScore[1]}`
+        : `${matchScore[0]}:${matchScore[1]}`;
+    return `${variantName[variant]} · ${sc} · ход ${pos?.turn_number ?? 0}`;
+  }
+  function currentSaved(): SavedGame | null {
+    if (!pos) return null;
+    return {
+      v: 1,
+      id: newId(),
+      name: defaultName(),
+      savedAt: new Date().toISOString(),
+      variant,
+      aiPly,
+      humanColor,
+      matchLength,
+      matchScore: [matchScore[0], matchScore[1]],
+      crawfordPlayed,
+      setup: {
+        variant,
+        turn: pos.turn,
+        white: pos.white,
+        black: pos.black,
+        off: pos.off,
+        dice: pos.dice,
+        cube: pos.cube,
+        crawford: pos.crawford,
+        turn_number: pos.turn_number,
+      },
+    };
+  }
+  function flash(msg: string) {
+    saveMsg = msg;
+    setTimeout(() => (saveMsg = ''), 2500);
+  }
+  function doSave() {
+    const g = currentSaved();
+    if (!g) return;
+    saveGame(g);
+    flash('Партия сохранена ✓');
+  }
+  async function doExport() {
+    const g = currentSaved();
+    if (!g) return;
+    exportStr = exportGame(g);
+    try {
+      await navigator.clipboard.writeText(exportStr);
+      flash('Строка скопирована ✓');
+    } catch {
+      flash('Скопируйте строку ниже');
+    }
+  }
+
+  // ---- review / replay from the game log ----
+  function toggleReview(i: number) {
+    reviewIdx = reviewIdx === i ? null : i;
+  }
+  // Rewind the engine to just before the move at `idx`, discard everything after.
+  async function rewindTo(idx: number): Promise<boolean> {
+    const e = history[idx];
+    if (!e) return false;
+    reviewIdx = null;
+    clearAnalysis();
+    clearMoveBuild();
+    aiLast = null;
+    aiAnim = null;
+    glide = null;
+    pos = await engine.setPosition(e.before);
+    history = history.slice(0, idx);
+    return true;
+  }
+  // "Переиграть": rewind to a human move and re-enter the move phase (same dice).
+  async function replayFrom(idx: number) {
+    if (!history[idx]?.isHuman) return;
+    try {
+      const dice = history[idx].dice;
+      if (!(await rewindTo(idx))) return;
+      await loadLegal();
+      await updateWin();
+      if (legal.length === 1 && legal[0].is_pass) {
+        status = 'Ходов нет, пропуск.';
+        await play(legal[0].id, true);
+        return;
+      }
+      phase = 'humanMove';
+      status = dice ? `Переиграйте ход (кости ${dice[0]}-${dice[1]}).` : 'Переиграйте ход.';
+      void analyze();
+    } catch (e) {
+      fail(e);
+    }
+  }
+  // Replay a specific alternative move directly from the review list.
+  async function replayWith(idx: number, alt: TurnDto) {
+    if (!history[idx]?.isHuman) return;
+    try {
+      if (!(await rewindTo(idx))) return;
+      await loadLegal();
+      const match =
+        legal.find((t) => fmtTurn(t) === fmtTurn(alt)) ?? legal.find((t) => t.id === alt.id);
+      if (!match) {
+        phase = 'humanMove';
+        status = 'Переиграйте ход.';
+        return;
+      }
+      await play(match.id, true);
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  // Fetch the deduped legal turns (list / analysis / AI) and the legal ordered
+  // sequences that drive interactive move-building, together.
+  async function loadLegal() {
+    legal = await engine.legalTurns();
+    sequences = await engine.legalSequences();
+  }
+
+  // Enter the move-building phase with dice ALREADY set on the engine.
+  async function enterHumanMove(d1: number, d2: number) {
+    pos = await engine.getPosition();
+    await loadLegal();
+    clearMoveBuild();
+    if (legal.length === 1 && legal[0].is_pass) {
+      status = `Кости ${d1}-${d2}: ходов нет, пропуск.`;
+      await play(legal[0].id, true);
+      return;
+    }
+    status = `Кости ${d1}-${d2}: кликните шашку или выберите ход.`;
+    phase = 'humanMove';
+    void analyze(); // обзор лучших ходов всегда на виду (без нажатия кнопки)
+  }
 
   async function humanRoll() {
     if (phase !== 'humanRoll') return;
@@ -277,16 +725,7 @@
       const d1 = rollDie(),
         d2 = rollDie();
       await engine.setDice(d1, d2);
-      pos = await engine.getPosition();
-      legal = await engine.legalTurns();
-      clearMoveBuild();
-      if (legal.length === 1 && legal[0].is_pass) {
-        status = `Кости ${d1}-${d2}: ходов нет, пропуск.`;
-        await play(legal[0].id, true);
-        return;
-      }
-      status = `Кости ${d1}-${d2}: кликните шашку или выберите ход.`;
-      phase = 'humanMove';
+      await enterHumanMove(d1, d2);
     } catch (e) {
       fail(e);
     }
@@ -314,15 +753,51 @@
 
   async function play(id: number, fromRoll = false) {
     if (!fromRoll && phase !== 'humanMove') return;
+    const chosen = legal.find((t) => t.id === id) ?? null;
+    const moverColor = pos ? pos.turn : humanColor;
+    const moverDice = pos ? pos.dice : null;
+    const moverN = pos ? pos.turn_number : 0;
+    const beforeSnap = pos ? snap(pos) : null;
+    const wasHuman = moverColor === humanColor;
     legal = [];
+    sequences = [];
     clearMoveBuild();
     clearAnalysis();
     phase = 'ai';
     status = 'Ход движка…';
     try {
+      // score the human's chosen move + capture all alternatives for review
+      let ev: { win: number; loss: number } | null = null;
+      let rankedAll: RankedTurnDto[] | null = null;
+      if (chosen && !chosen.is_pass) {
+        try {
+          const r = await engine.analyze(1);
+          rankedAll = r.slice(0, 8);
+          const mine = r.find((x) => x.turn.id === id);
+          if (mine) ev = { win: mine.win, loss: mine.equity_loss };
+        } catch {
+          /* eval is best-effort */
+        }
+      }
       const before = pos;
       pos = await engine.applyTurn(id);
       if (before) lastCells = changedCells(before, pos);
+      if (beforeSnap) {
+        history = [
+          ...history,
+          {
+            n: moverN,
+            color: moverColor,
+            dice: moverDice,
+            notation: chosen ? fmtTurn(chosen) : '—',
+            win: ev?.win ?? null,
+            loss: ev?.loss ?? null,
+            before: beforeSnap,
+            ranked: rankedAll,
+            isHuman: wasHuman,
+          },
+        ];
+      }
       await continueAfter();
     } catch (e) {
       fail(e);
@@ -356,15 +831,60 @@
     }
   }
 
-  async function aiRoll() {
-    const d1 = rollDie(),
-      d2 = rollDie();
+  // Glide the AI's chosen turn across the board, one sub-move at a time.
+  async function animateTurn(turn: TurnDto, color: PlayerColor, base: PositionDto) {
+    if (turn.is_pass) return;
+    let cur = base;
+    aiAnim = cur;
+    for (const mv of turn.moves) {
+      const bear = mv.bear_off;
+      if (bear) {
+        glide = { from: phys(color, mv.from), to: -1, color, bearOff: true };
+      } else if (mv.to > 0) {
+        glide = { from: phys(color, mv.from), to: phys(color, mv.to), color };
+      }
+      cur = posWithMoves(cur, color, [mv]);
+      aiAnim = cur;
+      await delay(bear ? BEAR_MS : ANIM_MS);
+      glide = null;
+    }
+    // keep the final animated board on screen; aiRoll clears it once `pos` commits
+  }
+
+  // Play one AI turn. `preset` forces the dice (used for the opening move, which
+  // is played with the two dice from the opening roll — no re-roll); otherwise the
+  // AI rolls its own pair.
+  async function aiRoll(preset?: [number, number]) {
+    const d1 = preset ? preset[0] : rollDie();
+    const d2 = preset ? preset[1] : rollDie();
     const before = pos;
     await engine.setDice(d1, d2);
+    pos = await engine.getPosition(); // reflect the dice on the board first
+    const beforeSnap = pos ? snap(pos) : null;
     const bm = await engine.bestMove(aiPly);
-    pos = await engine.applyTurn(bm.turn.id);
-    if (before) lastCells = changedCells(before, pos);
+    const aiN = before ? before.turn_number : (pos?.turn_number ?? 0);
     status = `Движок сыграл ${d1}-${d2}.`;
+    if (pos) await animateTurn(bm.turn, aiColor, pos); // glide the move
+    pos = await engine.applyTurn(bm.turn.id); // commit the exact engine state
+    aiAnim = null; // committed state now drives the board (no snap-back)
+    if (before) lastCells = changedCells(before, pos);
+    aiLast = { d1, d2, moves: fmtTurn(bm.turn) };
+    if (beforeSnap) {
+      history = [
+        ...history,
+        {
+          n: aiN,
+          color: aiColor,
+          dice: [d1, d2],
+          notation: fmtTurn(bm.turn),
+          win: bm.probs?.win ?? null,
+          loss: 0, // engine plays its own best
+          before: beforeSnap,
+          ranked: null,
+          isHuman: false,
+        },
+      ];
+    }
     await continueAfter();
   }
 
@@ -413,18 +933,16 @@
       clearAnalysis();
       clearMoveBuild();
       lastCells = [];
+      aiLast = null;
+      aiAnim = null;
+      history = [];
+      reviewIdx = null;
       pos = await engine.reset();
       currentGameCrawford = crawfordForNext();
       pos = await engine.setCrawford(currentGameCrawford);
       legal = [];
       await updateWin();
-      const intro = currentGameCrawford ? 'Кроуфорд (без куба). ' : '';
-      if (pos.turn === humanColor) {
-        phase = 'humanRoll';
-        status = `${intro}Ваш ход — бросайте.`;
-      } else {
-        await aiTurn();
-      }
+      startOpeningRoll();
     } catch (e) {
       fail(e);
     }
@@ -444,7 +962,7 @@
   };
 </script>
 
-<div class="play">
+<div class="play" class:fit={history.length > 0}>
   <header>
     <button class="link" onclick={onExit} disabled={phase === 'ai' || phase === 'rolling'}>
       ← меню
@@ -461,19 +979,26 @@
 
   {#if pos}
     <div class="winbar" title="Ваши шансы">
-      <div class="fill" style="width: {(humanWin * 100).toFixed(0)}%"></div>
-      <span class="label">вы {(humanWin * 100).toFixed(0)}%</span>
+      <div class="fill" style="transform: scaleX({displayWin})"></div>
+      <span class="label">вы {(displayWin * 100).toFixed(0)}%</span>
     </div>
 
     <Board
-      position={pos}
+      position={displayPos ?? aiAnim ?? pos}
       orientation={humanColor}
-      interactive={phase === 'humanMove'}
+      interactive={phase === 'humanMove' && !animating}
       sources={phase === 'humanMove' ? [...sourceCells] : []}
       dests={destCells}
       selected={selSource == null ? null : phys(humanColor, selSource)}
       {lastCells}
+      {glide}
+      canRoll={phase === 'humanRoll'}
+      {bearOffCell}
+      {boardStyle}
       onPointClick={handlePointClick}
+      {onDrop}
+      onRoll={humanRoll}
+      onBearOff={bearOffSelected}
     />
 
     <div class="panel">
@@ -486,7 +1011,52 @@
 
       <p class="status">{status}</p>
 
-      {#if phase === 'humanRoll'}
+      {#if aiLast}
+        <div class="ailast">
+          <span class="al-label">Соперник бросил</span>
+          <span class="al-dice">
+            {#each [aiLast.d1, aiLast.d2] as d}
+              <span class="minidie">
+                {#each Array(9) as _, idx}
+                  <span class="mp" class:on={PIPS[d]?.includes(idx)}></span>
+                {/each}
+              </span>
+            {/each}
+          </span>
+          <span class="al-moves">{aiLast.moves}</span>
+        </div>
+      {/if}
+
+      {#if phase === 'openingRoll'}
+        <div class="opening">
+          {#if !openRoll}
+            <p class="opening-hint">Кто выбросит больше — ходит первым.</p>
+            <button class="primary" onclick={doOpeningRoll}>🎲 Разыграть первый ход</button>
+          {:else}
+            <div class="open-dice">
+              <span class="od">
+                <span class="minidie">
+                  {#each Array(9) as _, idx}
+                    <span class="mp" class:on={PIPS[openRoll.you]?.includes(idx)}></span>
+                  {/each}
+                </span>
+                <span class="od-label">вы</span>
+              </span>
+              <span class="od">
+                <span class="minidie">
+                  {#each Array(9) as _, idx}
+                    <span class="mp" class:on={PIPS[openRoll.opp]?.includes(idx)}></span>
+                  {/each}
+                </span>
+                <span class="od-label">соперник</span>
+              </span>
+            </div>
+            <div class="open-res" class:win={openRoll.you > openRoll.opp}>
+              {openRoll.you > openRoll.opp ? '✓ Ваш первый ход' : 'Первым ходит соперник'}
+            </div>
+          {/if}
+        </div>
+      {:else if phase === 'humanRoll'}
         <div class="moves">
           <button class="primary" onclick={humanRoll}>🎲 Бросить кости</button>
           {#if canHumanDouble}
@@ -505,19 +1075,22 @@
         </div>
       {:else if phase === 'humanMove'}
         <div class="moves">
-          {#if bearOffHop}
-            <button class="primary" onclick={bearOffSelected}>Выкинуть шашку</button>
+          {#if completeSeq}
+            <button class="primary" onclick={confirmMove}>✓ Подтвердить ход</button>
+          {/if}
+          {#if bearOffChain}
+            <button class="primary" onclick={bearOffSelected}>Выкинуть шашку ↑</button>
+            <span class="hint">или свайпните фишку вверх</span>
           {/if}
           {#if pending.length}
             <button class="ghost" onclick={undoPending}>↶ Отменить ({pending.length})</button>
           {/if}
-          <button class="ghost" onclick={analyze} disabled={analyzing}>🔎 Оценка</button>
         </div>
         <details class="movelist">
           <summary>или выбрать ход из списка ({legal.length})</summary>
           <div class="moves">
             {#each legal as t}
-              <button onclick={() => play(t.id)}>{fmtTurn(t)}</button>
+              <button onclick={() => previewTurn(t)}>{fmtTurn(t)}</button>
             {/each}
           </div>
         </details>
@@ -531,14 +1104,28 @@
               </div>
             {/if}
             <ol class="ranked">
+              <li class="rhead">
+                <span class="mv">ход</span>
+                <span class="num" title="эквити — мера ценности с учётом марса (по ней сортировка)"
+                  >эквити</span
+                >
+                <span class="num" title="вероятность победы (без учёта марса)">win</span>
+                <span class="num" title="потеря эквити относительно лучшего хода">потеря</span>
+              </li>
               {#each ranked.slice(0, 6) as r, i}
-                <li class:best={i === 0}>
+                <li class="stagger" class:best={i === 0} style="--i: {i}">
                   <span class="mv">{fmtTurn(r.turn)}</span>
-                  <span class="num">win {(r.win * 100).toFixed(0)}%</span>
-                  <span class="num loss">{i === 0 ? 'лучший' : `−${r.equity_loss.toFixed(3)}`}</span>
+                  <span class="num eq">{fmtEq(r.equity)}</span>
+                  <span class="num">{(r.win * 100).toFixed(1)}%</span>
+                  <span class="num loss"
+                    >{i === 0 || r.equity_loss < 0.0005
+                      ? '✓ лучший'
+                      : `−${r.equity_loss.toFixed(3)}`}</span
+                  >
                 </li>
               {/each}
             </ol>
+            <p class="ranknote">Сортировка по эквити (учитывает марс), а не по чистому win%.</p>
           </div>
         {/if}
       {:else if phase === 'ai'}
@@ -556,7 +1143,114 @@
         </div>
       {/if}
 
-      <div class="meta">пипы: ⚪ {pos.pip[0]} · ⚫ {pos.pip[1]} · ход №{pos.turn_number}</div>
+      {#if phase === 'humanRoll' || phase === 'humanMove'}
+        <div class="savebar">
+          <button class="ghost" onclick={doSave}>💾 Сохранить</button>
+          <button class="ghost" onclick={doExport}>📤 Экспорт</button>
+          {#if saveMsg}<span class="savemsg">{saveMsg}</span>{/if}
+        </div>
+        {#if exportStr}
+          <textarea
+            class="exportbox"
+            readonly
+            rows="2"
+            onclick={(e) => (e.currentTarget as HTMLTextAreaElement).select()}
+            >{exportStr}</textarea
+          >
+        {/if}
+      {/if}
+
+      {#if phase === 'humanRoll' || phase === 'humanMove'}
+        <details class="resign">
+          <summary>🏳 Сдаться</summary>
+          <div class="moves">
+            {#if canResignSingle}
+              <button class="ghost" onclick={() => resign(false)} disabled={animating}>
+                Сдаться — оин (−{pos.cube.value})
+              </button>
+            {/if}
+            <button class="ghost danger" onclick={() => resign(true)} disabled={animating}>
+              Сдаться с марсом (−{2 * pos.cube.value})
+            </button>
+          </div>
+          {#if !canResignSingle}
+            <p class="hint">оин недоступен — марс ещё возможен (нет снятых шашек)</p>
+          {/if}
+        </details>
+      {/if}
+
+      {#if history.length}
+        <div class="gamelog" class:open={logOpen}>
+          <button
+            type="button"
+            class="gl-summary"
+            aria-expanded={logOpen}
+            onclick={() => (logOpen = !logOpen)}
+          >
+            Лист партии ({history.length})
+            <span class="gl-caret">{logOpen ? '▾' : '▸'}</span>
+          </button>
+          {#if logOpen}
+          <ol class="log">
+            {#each history as h, i}
+              <li>
+                <button
+                  type="button"
+                  class="logrow {sev(h.loss)}"
+                  class:me={h.color === humanColor}
+                  class:active={reviewIdx === i}
+                  onclick={() => toggleReview(i)}
+                  title="Показать другие варианты"
+                >
+                  <span class="ln">{h.n}</span>
+                  <span class="who">{h.color === humanColor ? 'вы' : 'движок'}</span>
+                  <span class="dc">{h.dice ? `${h.dice[0]}-${h.dice[1]}` : ''}</span>
+                  <span class="mv">{h.notation}</span>
+                  <span class="ev">{evalLabel(h)}</span>
+                  <span class="caret">{reviewIdx === i ? '▾' : '▸'}</span>
+                </button>
+                {#if reviewIdx === i}
+                  <div class="review">
+                    {#if h.ranked && h.ranked.length}
+                      <div class="review-head">Другие варианты:</div>
+                      <ol class="alts">
+                        {#each h.ranked as r, ri}
+                          <li>
+                            <button
+                              type="button"
+                              class="alt"
+                              class:best={ri === 0}
+                              class:played={fmtTurn(r.turn) === h.notation}
+                              disabled={!h.isHuman}
+                              onclick={() => replayWith(i, r.turn)}
+                              title={h.isHuman ? 'Сыграть этот вариант' : ''}
+                            >
+                              <span class="mv">{fmtTurn(r.turn)}</span>
+                              <span class="num eq">{fmtEq(r.equity)}</span>
+                              <span class="num">{(r.win * 100).toFixed(1)}%</span>
+                              {#if fmtTurn(r.turn) === h.notation}<span class="num played-tag"
+                                  >сыграно</span
+                                >{/if}
+                            </button>
+                          </li>
+                        {/each}
+                      </ol>
+                    {:else}
+                      <div class="review-head">Ход движка — альтернативы не сохранены.</div>
+                    {/if}
+                    {#if h.isHuman}
+                      <button class="ghost" onclick={() => replayFrom(i)}>↩ Переиграть этот ход</button>
+                    {/if}
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ol>
+          {/if}
+        </div>
+      {/if}
+
+      <div class="meta">пипсы: ⚪ {pos.pip[0]} · ⚫ {pos.pip[1]} · ход №{pos.turn_number}</div>
     </div>
   {:else}
     <p class="status">{status}</p>
@@ -587,7 +1281,7 @@
   .ghost {
     background: none;
     border: none;
-    color: #6b4423;
+    color: var(--ink-wood);
     cursor: pointer;
     font: inherit;
   }
@@ -596,9 +1290,19 @@
     cursor: default;
   }
   .ghost {
-    border: 1px solid #b5895c;
-    border-radius: 6px;
-    padding: 0.4rem 0.8rem;
+    background: var(--surface);
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-sm);
+    padding: 0.45rem 0.85rem;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out);
+  }
+  .ghost:hover {
+    background: var(--surface-raised);
+  }
+  .ghost:active {
+    transform: scale(0.97);
   }
   .ghost:disabled {
     opacity: 0.5;
@@ -606,16 +1310,24 @@
   }
   .winbar {
     position: relative;
-    height: 22px;
-    background: #333;
-    border-radius: 11px;
+    height: 26px;
+    background: linear-gradient(180deg, #3a3a3e, #161618);
+    border: 1px solid #5a371d;
+    border-radius: 13px;
     overflow: hidden;
     margin-bottom: 0.6rem;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
   }
   .winbar .fill {
-    height: 100%;
-    background: linear-gradient(90deg, #e8e8e8, #cfcfcf);
-    transition: width 0.4s ease;
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    background: linear-gradient(180deg, #fffdf7, #e6ddc8);
+    transform-origin: left center;
+    will-change: transform;
+  }
+  .winbar .label {
+    font-variant-numeric: var(--num-tabular);
   }
   .winbar .label {
     position: absolute;
@@ -623,7 +1335,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font: 600 12px system-ui;
+    font: 700 12px system-ui;
     color: #000;
     mix-blend-mode: difference;
     filter: invert(1);
@@ -644,6 +1356,152 @@
     font-weight: 600;
     min-height: 1.4em;
   }
+  .ailast {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin: -0.2rem 0 0.6rem;
+    padding: 0.4rem 0.7rem;
+    background: #f1ece3;
+    border-left: 3px solid #6b4423;
+    border-radius: 4px;
+    font: 0.9rem ui-monospace, monospace;
+    color: #4a3320;
+  }
+  .al-label {
+    font-weight: 700;
+    color: #6b4423;
+  }
+  .al-dice {
+    display: inline-flex;
+    gap: 4px;
+  }
+  .minidie {
+    width: 22px;
+    height: 22px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 1px;
+    padding: 3px;
+    box-sizing: border-box;
+    background: linear-gradient(145deg, #fffdf7, #e6ddc8);
+    border-radius: 5px;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.35),
+      inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  }
+  .mp {
+    border-radius: 50%;
+    align-self: center;
+    justify-self: center;
+    width: 4px;
+    height: 4px;
+    background: transparent;
+  }
+  .mp.on {
+    background: #2a1a0c;
+  }
+  .al-moves {
+    margin-left: auto;
+    color: #4a3320;
+  }
+  .hint {
+    font-size: 0.8rem;
+    color: #a08a6a;
+    font-style: italic;
+  }
+  .opening {
+    padding: 0.4rem 0;
+  }
+  .opening-hint {
+    margin: 0 0 0.6rem;
+    color: var(--ink-muted);
+    font-size: 0.9rem;
+  }
+  .open-dice {
+    display: flex;
+    gap: 1.4rem;
+    align-items: center;
+    margin-bottom: 0.6rem;
+  }
+  .od {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--ink-muted);
+    font-size: 0.9rem;
+  }
+  .od .minidie {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 1px;
+    padding: 4px;
+    box-sizing: border-box;
+    background: linear-gradient(145deg, #fffdf7, #e6ddc8);
+    border-radius: 6px;
+    box-shadow: var(--shadow-1), inset 0 1px 1px rgba(255, 255, 255, 0.6);
+    animation: reveal var(--dur-quick) var(--ease-settle);
+  }
+  .od .mp {
+    align-self: center;
+    justify-self: center;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: transparent;
+  }
+  .od .mp.on {
+    background: #2a1a0c;
+  }
+  .open-res {
+    font-weight: 700;
+    color: var(--ink-muted);
+  }
+  .open-res.win {
+    color: var(--ok);
+  }
+  .savebar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.7rem;
+  }
+  .savemsg {
+    color: #2a6;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .exportbox {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 0.4rem;
+    font: 0.78rem ui-monospace, monospace;
+    border: 1px solid #d8c4a6;
+    border-radius: 8px;
+    padding: 0.4rem;
+    resize: vertical;
+    color: #4a3320;
+  }
+  .resign {
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+  }
+  .resign > summary {
+    cursor: pointer;
+    color: #a06a4a;
+    width: max-content;
+  }
+  .resign .moves {
+    margin-top: 0.4rem;
+  }
+  .ghost.danger {
+    border-color: #c79a9a;
+    color: #b22;
+  }
   .moves {
     display: flex;
     flex-wrap: wrap;
@@ -663,13 +1521,26 @@
   }
   button.primary {
     font-size: 1rem;
-    padding: 0.5rem 1.1rem;
+    padding: 0.55rem 1.15rem;
     border: none;
-    border-radius: 8px;
-    background: #6b4423;
+    border-radius: var(--radius-md);
+    background: linear-gradient(180deg, var(--btn-primary-hi), var(--btn-primary));
     color: #fff;
     cursor: pointer;
-    font-family: system-ui, sans-serif;
+    font-family: var(--font-ui);
+    font-weight: var(--fw-semi);
+    box-shadow: var(--shadow-2), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    transition:
+      transform var(--dur-instant) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out),
+      filter var(--dur-fast) var(--ease-out);
+  }
+  button.primary:hover {
+    filter: brightness(1.06);
+    box-shadow: var(--shadow-3), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  }
+  button.primary:active {
+    transform: scale(0.97);
   }
   .thinking {
     color: #888;
@@ -714,13 +1585,20 @@
     list-style: none;
     margin: 0;
     padding: 0;
-    font: 0.9rem ui-monospace, monospace;
+    font: 0.88rem ui-monospace, monospace;
   }
   .ranked li {
     display: flex;
-    gap: 0.8rem;
-    padding: 0.15rem 0;
+    gap: 0.6rem;
+    padding: 0.18rem 0;
     border-bottom: 1px dotted #e0d4bf;
+  }
+  .ranked li.rhead {
+    color: #a08a6a;
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-bottom: 1px solid #d9c7a8;
   }
   .ranked li.best {
     font-weight: 700;
@@ -728,18 +1606,285 @@
   }
   .ranked .mv {
     flex: 1;
+    min-width: 0;
   }
   .ranked .num {
-    width: 6.5rem;
+    width: 4.6rem;
     text-align: right;
     color: #777;
+  }
+  .ranked .num.eq {
+    color: #3a2e1c;
+    font-weight: 600;
   }
   .ranked li.best .num {
     color: #2a6;
   }
+  .ranknote {
+    margin: 0.35rem 0 0;
+    font-size: 0.74rem;
+    color: #a08a6a;
+  }
+  .gamelog {
+    margin-top: 0.9rem;
+    border: 1px solid #e2d3bb;
+    border-radius: 8px;
+    background: #fcf8f1;
+  }
+  .gl-summary {
+    display: block;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    padding: 0.5rem 0.7rem;
+    font: 600 1rem var(--font-ui);
+    color: #6b4423;
+    background: none;
+    border: none;
+    border-radius: 8px;
+  }
+  .gl-summary:hover {
+    background: #f6efe2;
+  }
+  .gl-caret {
+    float: right;
+    color: #bba784;
+  }
+  .log {
+    list-style: none;
+    margin: 0;
+    padding: 0 0.4rem 0.4rem;
+    max-height: 220px;
+    overflow-y: auto;
+    font: 0.86rem ui-monospace, monospace;
+  }
+  .logrow {
+    display: grid;
+    grid-template-columns: 1.6rem 3.2rem 2.4rem 1fr auto 0.9rem;
+    gap: 0.5rem;
+    align-items: center;
+    width: 100%;
+    padding: 0.28rem 0.3rem;
+    border: none;
+    border-bottom: 1px dotted #e8dcc6;
+    background: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 5px;
+  }
+  .logrow:hover {
+    background: #f6efe2;
+  }
+  .logrow.active {
+    background: #f3e6d2;
+  }
+  .logrow .caret {
+    color: #bba784;
+    text-align: right;
+  }
+  .logrow .ln {
+    color: #aaa;
+    text-align: right;
+  }
+  .logrow .who {
+    color: #6b4423;
+  }
+  .logrow.me .who {
+    font-weight: 700;
+  }
+  .logrow .dc {
+    color: #888;
+  }
+  .logrow .mv {
+    color: #2c2c2c;
+  }
+  .logrow .ev {
+    text-align: right;
+    color: #999;
+    white-space: nowrap;
+  }
+  .logrow.ok .ev {
+    color: #2a6;
+  }
+  .logrow.inacc .ev {
+    color: #b80;
+  }
+  .logrow.blunder .ev {
+    color: #c22;
+    font-weight: 700;
+  }
+  .review {
+    padding: 0.5rem 0.4rem 0.6rem 1.6rem;
+    border-bottom: 1px dotted #e8dcc6;
+    background: #fcf8f1;
+  }
+  .review-head {
+    font: 600 0.78rem system-ui;
+    color: #a08a6a;
+    margin-bottom: 0.35rem;
+  }
+  .alts {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+  }
+  .alt {
+    display: grid;
+    grid-template-columns: 1fr 4.4rem 3.6rem auto;
+    gap: 0.5rem;
+    align-items: center;
+    width: 100%;
+    padding: 0.2rem 0.3rem;
+    border: none;
+    background: none;
+    font: 0.84rem ui-monospace, monospace;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 5px;
+  }
+  .alt:hover:not(:disabled) {
+    background: #f1e6d2;
+  }
+  .alt:disabled {
+    cursor: default;
+  }
+  .alt .num {
+    text-align: right;
+    color: #888;
+  }
+  .alt .num.eq {
+    color: #3a2e1c;
+    font-weight: 600;
+  }
+  .alt.best {
+    color: #2a6;
+    font-weight: 700;
+  }
+  .alt.best .num {
+    color: #2a6;
+  }
+  .alt.played {
+    background: #efe3cd;
+  }
+  .alt .played-tag {
+    color: #6b4423;
+    font-style: italic;
+  }
   .meta {
     margin-top: 0.8rem;
-    color: #777;
+    color: var(--ink-faint);
     font-size: 0.85rem;
+    font-variant-numeric: var(--num-tabular);
+  }
+  .score {
+    font-variant-numeric: var(--num-tabular);
+  }
+  .ranked,
+  .log {
+    font-variant-numeric: var(--num-tabular);
+  }
+  .analysis,
+  .ailast {
+    animation: reveal var(--dur-base) var(--ease-decelerate);
+  }
+  .ranked li.stagger {
+    animation: reveal var(--dur-base) var(--ease-decelerate) backwards;
+    animation-delay: calc(var(--i, 0) * 38ms);
+  }
+  @keyframes reveal {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .analysis,
+    .ailast,
+    .ranked li.stagger {
+      animation: none;
+    }
+  }
+  @media (max-width: 600px) {
+    .play {
+      max-width: 100%;
+    }
+    /* The sparse opening/roll screen keeps a tall board to fill the view; once a
+       game is in progress (.fit) the board is a bit shorter so the controls and a
+       ROOMY, scrollable game log / move-review sit comfortably below. The page
+       scrolls as needed — the review reads far better with real room than crammed
+       into a tiny internal-scroll box. */
+    .play.fit :global(.board) {
+      --row-h: clamp(
+        calc(var(--pt) * 3.0),
+        calc((var(--pt) * 4.4 + (100dvh - 24rem) / 2) / 2),
+        27dvh
+      );
+    }
+    header {
+      gap: 0.6rem;
+      margin-bottom: 0.3rem;
+    }
+    .winbar {
+      margin-bottom: 0.45rem;
+    }
+    .panel {
+      margin-top: 0.55rem;
+    }
+    .status {
+      font-size: 1rem;
+      margin: 0.2rem 0;
+    }
+    /* compact the secondary controls so the active play area + a scrollable game
+       log fit the screen without the page itself scrolling */
+    .ailast {
+      margin: 0 0 0.4rem;
+      padding: 0.3rem 0.6rem;
+      font-size: 0.82rem;
+      gap: 0.4rem;
+    }
+    .savebar,
+    .resign,
+    .meta {
+      margin-top: 0.4rem;
+    }
+    .meta {
+      font-size: 0.8rem;
+    }
+    /* the full-move list is redundant with click-to-move + «Оценка» on a phone;
+       hide it to keep the screen fitting without scroll */
+    .movelist {
+      display: none;
+    }
+    /* roomy, scrollable game log so the move-review (alternatives + replay) reads
+       comfortably — the list scrolls inside this box; the page scrolls to reveal
+       it (this is the pre-0.9.6 behaviour the cramped fit-box regressed) */
+    .log {
+      max-height: clamp(200px, 46dvh, 340px);
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+    }
+    /* larger, comfortable touch targets on phones */
+    .moves button,
+    .ghost,
+    .movelist summary,
+    .resign > summary {
+      padding: 0.55rem 0.85rem;
+      min-height: 42px;
+      display: inline-flex;
+      align-items: center;
+    }
+    button.primary {
+      padding: 0.6rem 1.05rem;
+      min-height: 44px;
+    }
+    .logrow,
+    .alt {
+      min-height: 36px;
+    }
   }
 </style>

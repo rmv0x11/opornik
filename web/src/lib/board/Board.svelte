@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import type { PositionDto } from '../../engine/types';
-  import { buildSlotToCell, phys, type PlayerColor } from './coords';
+  import { buildSlotToCell, phys, posOfPhys, type PlayerColor } from './coords';
 
   let {
     position,
@@ -11,7 +11,14 @@
     dests = [],
     selected = null,
     lastCells = [],
+    glide = null,
+    canRoll = false,
+    bearOffCell = null,
+    boardStyle = '',
     onPointClick,
+    onDrop,
+    onRoll,
+    onBearOff,
   }: {
     position: PositionDto;
     orientation?: PlayerColor;
@@ -20,7 +27,14 @@
     dests?: number[];
     selected?: number | null;
     lastCells?: number[]; // physical cells touched by the most recent move (pulse)
+    glide?: { from: number; to: number; color: PlayerColor; bearOff?: boolean } | null; // fly a piece (point→point, or point→tray on bear-off)
+    canRoll?: boolean; // show a clickable roll prompt in the centre
+    bearOffCell?: number | null; // the selected checker's cell, if it can bear off
+    boardStyle?: string; // theme CSS-variable overrides applied to the board
     onPointClick?: (cell: number) => void;
+    onDrop?: (cell: number) => void; // drag release over a destination
+    onRoll?: () => void; // tap the centre of the board to roll
+    onBearOff?: () => void; // swipe a checker up (out of the board) to bear it off
   } = $props();
 
   interface Cell {
@@ -42,6 +56,16 @@
   const topSlots = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
   const bottomSlots = [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
 
+  // Dot layout per die value (indices into a 3×3 grid).
+  const PIPS: Record<number, number[]> = {
+    1: [4],
+    2: [0, 8],
+    3: [0, 4, 8],
+    4: [0, 2, 6, 8],
+    5: [0, 2, 4, 6, 8],
+    6: [0, 2, 3, 5, 6, 8],
+  };
+
   function discs(count: number): number {
     return Math.min(count, 5);
   }
@@ -50,6 +74,7 @@
   }
 
   // ---- drag (select source on press-move, apply on release over a destination) ----
+  const SWIPE_UP = 40; // px of upward drag that triggers a bear-off
   let downCell: number | null = null;
   let downXY = { x: 0, y: 0 };
   let dragging = $state(false);
@@ -87,7 +112,12 @@
     window.removeEventListener('pointerup', onWinUp);
     if (dragging) {
       const t = cellFromEl(document.elementFromPoint(e.clientX, e.clientY));
-      if (t != null && destSet.has(t)) onPointClick?.(t);
+      if (t != null && destSet.has(t)) {
+        onDrop?.(t);
+      } else if (downCell != null && downCell === bearOffCell && e.clientY - downXY.y < -SWIPE_UP) {
+        // dragged the checker upward, out of the board → bear it off
+        onBearOff?.();
+      }
     }
     dragging = false;
     dragColor = null;
@@ -97,6 +127,79 @@
     window.removeEventListener('pointermove', onWinMove);
     window.removeEventListener('pointerup', onWinUp);
   });
+
+  // ---- glide animation: a piece flying from one point's centre to another ----
+  // Compositor-only: the wrapper holds the FROM centre (left/top, static) and we
+  // animate the inner disc's TRANSFORM (pick-up → travel → settle) via WAAPI.
+  let gx = $state(0);
+  let gy = $state(0);
+  let gShown = $state(false);
+  let glideEl = $state<HTMLDivElement>();
+  $effect(() => {
+    if (!glide) {
+      gShown = false;
+      return;
+    }
+    const f = document.querySelector(`.board [data-cell="${glide.from}"]`)?.getBoundingClientRect();
+    const t = glide.bearOff
+      ? document.querySelector(`.board .off-chip.${glide.color}`)?.getBoundingClientRect()
+      : document.querySelector(`.board [data-cell="${glide.to}"]`)?.getBoundingClientRect();
+    if (!f || !t) {
+      gShown = false;
+      return;
+    }
+    gx = f.x + f.width / 2;
+    gy = f.y + f.height / 2;
+    gShown = true;
+    const dx = t.x + t.width / 2 - gx;
+    const dy = t.y + t.height / 2 - gy;
+    const bearOff = !!glide.bearOff;
+    const reduceMotion =
+      typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    requestAnimationFrame(() => {
+      const el = glideEl;
+      if (!el) return;
+      if (reduceMotion) {
+        el.style.transform = bearOff ? 'scale(0)' : `translate(${dx}px, ${dy}px)`;
+        return;
+      }
+      el.style.willChange = 'transform';
+      // Bear-off: lift up and arc out into the tray, shrinking + fading on the way.
+      const lift = Math.min(40, Math.abs(dy) * 0.4 + 18);
+      const keyframes = bearOff
+        ? [
+            { transform: 'translate(0,0) scale(1)', opacity: 1 },
+            {
+              transform: `translate(${dx * 0.45}px, ${dy * 0.4 - lift}px) scale(1.08)`,
+              opacity: 1,
+              offset: 0.4,
+              easing: 'cubic-bezier(.2,0,.2,1)',
+            },
+            { transform: `translate(${dx}px, ${dy}px) scale(0.42)`, opacity: 0, offset: 1 },
+          ]
+        : [
+            { transform: 'translate(0,0) scale(1)' },
+            { transform: 'translate(0,-4px) scale(1.1)', offset: 0.16, easing: 'cubic-bezier(.05,.7,.1,1)' },
+            {
+              transform: `translate(${dx * 1.02}px, ${dy * 1.02}px) scale(1.05)`,
+              offset: 0.86,
+              easing: 'cubic-bezier(.34,1.16,.64,1)',
+            },
+            { transform: `translate(${dx}px, ${dy}px) scaleX(1.06) scaleY(0.92)`, offset: 0.94 },
+            { transform: `translate(${dx}px, ${dy}px) scale(1)`, offset: 1 },
+          ];
+      const anim = el.animate(keyframes, {
+        duration: bearOff ? 440 : 280,
+        fill: 'forwards',
+        easing: bearOff ? 'cubic-bezier(.4,0,.7,1)' : 'cubic-bezier(.05,.7,.1,1)',
+      });
+      anim.finished
+        .then(() => {
+          if (el) el.style.willChange = '';
+        })
+        .catch(() => {});
+    });
+  });
 </script>
 
 <div
@@ -104,8 +207,10 @@
   class:interactive
   role="application"
   aria-label="Игровая доска"
+  style={boardStyle}
   onpointerdown={onBoardPointerDown}
 >
+  <div class="table">
   <div class="row top">
     {#each topSlots as slot, i}
       {#if i === 6}<div class="bar"></div>{/if}
@@ -122,6 +227,8 @@
         data-cell={cell}
         onclick={() => click(cell)}
       >
+        <span class="tri"></span>
+        <span class="ptnum up">{posOfPhys(orientation, cell)}</span>
         {#if destSet.has(cell)}<span class="dot"></span>{/if}
         <span class="stack down">
           {#if c.color}
@@ -133,18 +240,6 @@
         </span>
       </button>
     {/each}
-  </div>
-
-  <div class="midbar">
-    <span>дом ↓ {orientation === 'white' ? '⚪' : '⚫'}</span>
-    <span class="dicewrap">
-      {#key position.dice}
-        <span class="dice rolling">
-          {#if position.dice}🎲 {position.dice[0]}–{position.dice[1]}{:else}—{/if}
-        </span>
-      {/key}
-    </span>
-    <span>сброс: ⚪{position.off[0]} · ⚫{position.off[1]}</span>
   </div>
 
   <div class="row bottom">
@@ -163,6 +258,8 @@
         data-cell={cell}
         onclick={() => click(cell)}
       >
+        <span class="tri"></span>
+        <span class="ptnum down">{posOfPhys(orientation, cell)}</span>
         {#if destSet.has(cell)}<span class="dot"></span>{/if}
         <span class="stack up">
           {#if c.color}
@@ -175,81 +272,210 @@
       </button>
     {/each}
   </div>
+  </div>
+
+  <div class="rail">
+    <div class="dice-slot">
+      {#if canRoll}
+        <button type="button" class="rollzone" onclick={() => onRoll?.()} aria-label="Бросок костей">
+          <span class="cup-row">
+            <span class="cup die-face">🎲</span>
+            <span class="cup die-face">🎲</span>
+          </span>
+          <span class="rolltext">бросок</span>
+        </button>
+      {:else if position.dice}
+        {#key position.dice}
+          {#each position.dice as d}
+            <span class="die {position.turn} rolling" aria-label={`кость ${d}`}>
+              {#each Array(9) as _, idx}
+                <span class="pip" class:on={PIPS[d]?.includes(idx)}></span>
+              {/each}
+            </span>
+          {/each}
+        {/key}
+      {/if}
+    </div>
+
+    <div class="off-tray" title="снято с доски">
+      <span class="off-row"><span class="off-chip white"></span>{position.off[0]}</span>
+      <span class="off-row"><span class="off-chip black"></span>{position.off[1]}</span>
+    </div>
+
+    <div class="home-label">дом<br />{orientation === 'white' ? '⚪' : '⚫'}</div>
+  </div>
 </div>
 
 {#if dragging && dragColor}
-  <div
-    class="ghost checker {dragColor}"
-    style="left: {dragXY.x}px; top: {dragXY.y}px"
-  ></div>
+  <div class="ghost checker {dragColor}" style="left: {dragXY.x}px; top: {dragXY.y}px"></div>
+{/if}
+
+{#if glide && gShown}
+  <div class="glidewrap" style="left: {gx}px; top: {gy}px">
+    <div bind:this={glideEl} class="glidepiece checker {glide.color}"></div>
+  </div>
 {/if}
 
 <style>
   .board {
-    --pt: clamp(28px, 6vw, 56px);
-    background: #b5895c;
-    border: 8px solid #6b4423;
-    border-radius: 6px;
+    /* a narrow side rail (dice + bear-off tray + home) sits to the RIGHT of the
+       playing field; the field's 12 points + central bar ≈ 13 units fill the rest
+       of the viewport width, capped on desktop so the whole board stays on-screen */
+    --rail: clamp(44px, 11vw, 68px);
+    --pt: clamp(18px, calc((100vw - 3.5rem - var(--rail)) / 13), 50px);
+    /* row height: on wide screens proportional to the point width; on portrait
+       phones it grows to fill the otherwise-wasted vertical space (taller points),
+       leaving ~14rem of chrome for the controls below. */
+    --row-h: calc(var(--pt) * 4.4);
+    background: linear-gradient(150deg, var(--wood-hi), var(--wood-mid));
+    border: clamp(8px, 1.4vw, 14px) solid;
+    border-image: linear-gradient(150deg, var(--wood), var(--wood-edge)) 1;
+    border-radius: var(--radius-lg);
     padding: 6px;
     display: flex;
-    flex-direction: column;
-    gap: 4px;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 6px;
     user-select: none;
     touch-action: none;
+    box-shadow: var(--bevel-wood), var(--shadow-board);
+  }
+  /* the playing field: two rows that meet directly (no horizontal bar) — the
+     central vertical bar inside each row forms the continuous divider */
+  .table {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .row {
     display: flex;
-    gap: 2px;
-    height: calc(var(--pt) * 4.2);
+    gap: 0;
+    height: var(--row-h);
+    background: var(--felt);
+    box-shadow: var(--inset-felt);
+  }
+  /* Portrait phones: the board is intrinsically wide-but-short, so let the points
+     grow tall to use the full screen height instead of leaving the lower half
+     empty. Falls back to the proportional height if dvh is unsupported. */
+  @media (max-width: 600px) {
+    .board {
+      /* middle ground: the average of the proportional height (compact) and the
+         full screen-fill height — board uses ~half the screen without elongating
+         the points so far that the page has to scroll. The reserve leaves room for
+         the play controls + game log below. */
+      --row-h: clamp(
+        calc(var(--pt) * 3.2),
+        calc((var(--pt) * 4.4 + (100dvh - 17rem) / 2) / 2),
+        33dvh
+      );
+    }
+  }
+  .row.top {
+    border-radius: 4px 4px 0 0;
+  }
+  .row.bottom {
+    border-radius: 0 0 4px 4px;
   }
   .point {
     width: var(--pt);
-    background: #e8d3b0;
     position: relative;
     display: flex;
     padding: 0;
     margin: 0;
-    border: 2px solid transparent;
-    border-radius: 0;
+    border: none;
+    background: transparent;
     cursor: default;
     font: inherit;
+    overflow: visible;
+  }
+  /* the triangular point itself */
+  .tri {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background: var(--point-light);
+    transition:
+      background var(--dur-fast) var(--ease-standard),
+      filter var(--dur-fast) var(--ease-standard);
+  }
+  .point.dark .tri {
+    background: var(--point-dark);
+  }
+  .point.up .tri {
+    clip-path: polygon(2% 0, 98% 0, 50% 92%);
+  }
+  .point.down .tri {
+    clip-path: polygon(50% 8%, 2% 100%, 98% 100%);
+  }
+  /* point numbers (mover/orientation perspective) on the outer edge */
+  .ptnum {
+    position: absolute;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font: 600 9px ui-monospace, monospace;
+    color: var(--felt-label, #efe6d4);
+    opacity: 0.55;
+    z-index: 2;
+    pointer-events: none;
+  }
+  .ptnum.up {
+    top: 1px;
+  }
+  .ptnum.down {
+    bottom: 1px;
   }
   .board.interactive .point {
     cursor: pointer;
   }
-  .point.dark {
-    background: #c9a06a;
+  /* highlights act on the triangle so they follow the point shape */
+  .point.source .tri {
+    background: var(--hl-source);
   }
-  .point.source {
-    box-shadow: inset 0 0 0 3px rgba(40, 160, 90, 0.55);
+  .point.dark.source .tri {
+    background: var(--hl-source-dark);
   }
-  .point.selected {
-    box-shadow: inset 0 0 0 3px #2a6;
+  .point.selected .tri {
+    background: var(--hl-selected);
+    filter: drop-shadow(0 0 5px var(--hl-selected-glow));
   }
-  .point.last {
+  .point.last .tri {
     animation: lastpulse 1s ease;
   }
   @keyframes lastpulse {
     0% {
-      outline: 3px solid rgba(255, 200, 60, 0.95);
-      outline-offset: -3px;
+      filter: drop-shadow(0 0 0 rgba(255, 210, 70, 0)) brightness(1.7);
     }
     100% {
-      outline: 3px solid rgba(255, 200, 60, 0);
-      outline-offset: -3px;
+      filter: drop-shadow(0 0 0 rgba(255, 210, 70, 0)) brightness(1);
     }
   }
   .dot {
     position: absolute;
     top: 50%;
     left: 50%;
-    width: 38%;
+    width: 34%;
     aspect-ratio: 1;
     transform: translate(-50%, -50%);
-    background: rgba(40, 160, 90, 0.6);
+    background: radial-gradient(circle at 40% 35%, var(--hl-dest-core), var(--hl-dest));
     border-radius: 50%;
     z-index: 3;
     pointer-events: none;
+    box-shadow: 0 0 7px var(--hl-selected-glow);
+    animation: dotpop var(--dur-fast) var(--ease-decelerate);
+  }
+  @keyframes dotpop {
+    from {
+      transform: translate(-50%, -50%) scale(0.4);
+      opacity: 0;
+    }
+    to {
+      transform: translate(-50%, -50%) scale(1);
+      opacity: 1;
+    }
   }
   .stack {
     display: flex;
@@ -257,8 +483,10 @@
     align-items: center;
     width: 100%;
     gap: 1px;
-    padding: 2px 0;
+    padding: 3px 0;
     pointer-events: none;
+    position: relative;
+    z-index: 1;
   }
   .stack.up {
     justify-content: flex-end;
@@ -267,82 +495,239 @@
     justify-content: flex-start;
   }
   .checker {
-    width: calc(var(--pt) * 0.78);
-    height: calc(var(--pt) * 0.78);
+    width: calc(var(--pt) * 0.82);
+    height: calc(var(--pt) * 0.82);
     border-radius: 50%;
     flex: 0 0 auto;
+    box-shadow: var(--checker-bevel), var(--checker-drop);
   }
   .checker.white {
-    background: radial-gradient(circle at 35% 30%, #fff, #d8d8d8);
-    border: 1px solid #999;
+    background: var(--checker-grad-white);
+    border: 1px solid var(--chip-white-edge, #b1a78f);
   }
   .checker.black {
-    background: radial-gradient(circle at 35% 30%, #555, #111);
-    border: 1px solid #000;
+    background: var(--checker-grad-black);
+    border: 1px solid var(--chip-black-edge, #101013);
   }
   .ghost {
     position: fixed;
-    width: clamp(24px, 5vw, 46px);
-    height: clamp(24px, 5vw, 46px);
-    transform: translate(-50%, -50%);
+    width: clamp(24px, 5vw, 48px);
+    height: clamp(24px, 5vw, 48px);
+    transform: translate(-50%, -50%) scale(1.08);
+    transition: none;
     z-index: 100;
     pointer-events: none;
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--checker-bevel), var(--shadow-drag);
+  }
+  .glidewrap {
+    position: fixed;
+    transform: translate(-50%, -50%);
+    z-index: 90;
+    pointer-events: none;
+  }
+  .glidepiece {
+    width: clamp(24px, 5vw, 48px);
+    height: clamp(24px, 5vw, 48px);
+    box-shadow: var(--checker-bevel), var(--shadow-drag);
+    /* transform driven by the Web Animations API (compositor-only) */
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot {
+      animation: none;
+    }
   }
   .badge {
     position: absolute;
-    top: 2px;
+    top: 4px;
     left: 50%;
     transform: translateX(-50%);
-    font: 600 12px system-ui;
+    font: 700 11px system-ui;
     color: #fff;
-    background: rgba(0, 0, 0, 0.6);
-    border-radius: 8px;
-    padding: 0 5px;
+    background: rgba(0, 0, 0, 0.65);
+    border-radius: 9px;
+    padding: 1px 6px;
     z-index: 4;
   }
   .point.down .badge {
     top: auto;
-    bottom: 2px;
+    bottom: 4px;
   }
   .bar {
-    width: calc(var(--pt) * 0.5);
-    background: #6b4423;
-    border-radius: 3px;
+    width: calc(var(--pt) * 0.6);
+    background: linear-gradient(90deg, var(--wood-dark), var(--wood), var(--wood-dark));
+    box-shadow: inset 0 0 8px hsl(28 45% 12% / 0.5);
   }
-  .midbar {
+  /* right-side rail: dice on top, the bear-off tray in the middle, home at the
+     bottom — like the side tray of a real board */
+  .rail {
+    width: var(--rail);
+    flex: 0 0 var(--rail);
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
     align-items: center;
-    font: 600 13px system-ui;
-    color: #3a2410;
-    padding: 2px 6px;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 2px;
+    background: linear-gradient(180deg, var(--bar-wood), var(--wood-dark));
+    border-radius: var(--radius-sm);
+    box-shadow: inset 0 0 10px hsl(28 45% 12% / 0.45);
+    color: var(--felt-label);
+    font: var(--fw-semi) 12px var(--font-ui);
+    font-variant-numeric: var(--num-tabular);
   }
-  .dicewrap {
+  .dice-slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+  }
+  .off-tray {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .off-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .home-label {
+    text-align: center;
+    line-height: 1.15;
+    font-size: 11px;
+    opacity: 0.85;
+  }
+  .off-chip {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
     display: inline-block;
   }
-  .dice {
+  .off-chip.white {
+    background: var(--checker-grad-white);
+    border: 1px solid var(--chip-white-edge, #9a8f78);
+  }
+  .off-chip.black {
+    background: var(--checker-grad-black);
+    border: 1px solid var(--chip-black-edge, #000);
+  }
+  .rollzone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 3px;
+    border: 1px solid var(--wood-hi);
+    border-radius: var(--radius-sm);
+    background: linear-gradient(180deg, var(--wood), var(--wood-mid));
+    color: var(--felt-label);
+    font: var(--fw-bold) 11px var(--font-ui);
+    cursor: pointer;
+    box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
+    animation: reveal var(--dur-base) var(--ease-decelerate);
+  }
+  .rollzone:hover {
+    background: linear-gradient(180deg, var(--wood-hi), var(--wood));
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-2), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  }
+  .rollzone:active {
+    transform: scale(0.97);
+  }
+  .rollzone .cup-row {
+    display: inline-flex;
+    gap: 3px;
+  }
+  .rollzone .die-face {
     font-size: 15px;
+    line-height: 1;
     display: inline-block;
   }
-  .dice.rolling {
-    animation: roll 0.4s ease;
+  .rollzone .rolltext {
+    letter-spacing: 0.02em;
   }
-  @keyframes roll {
-    0% {
-      transform: scale(0.6) rotate(-10deg);
-      opacity: 0.3;
+  @keyframes reveal {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
     }
-    60% {
-      transform: scale(1.15) rotate(6deg);
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rollzone {
+      animation: none;
+    }
+  }
+  .die {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 1px;
+    padding: 4px;
+    border-radius: var(--radius-sm);
+    box-sizing: border-box;
+    box-shadow: var(--die-bevel), var(--shadow-1);
+  }
+  .die.white {
+    background: linear-gradient(145deg, #fffdf7, #e6ddc8);
+  }
+  .die.black {
+    background: linear-gradient(145deg, #3a3a3e, #161618);
+  }
+  .pip {
+    border-radius: 50%;
+    align-self: center;
+    justify-self: center;
+    width: 6px;
+    height: 6px;
+    background: transparent;
+  }
+  .die.white .pip.on {
+    background: #2a1a0c;
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.6);
+  }
+  .die.black .pip.on {
+    background: #f3ece0;
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.5);
+  }
+  .die.rolling {
+    animation: tumble var(--dur-tumble) var(--spring-land);
+  }
+  /* the second die lands a beat after the first (two dice thrown) */
+  .die.rolling ~ .die.rolling {
+    animation-delay: 55ms;
+  }
+  @keyframes tumble {
+    0% {
+      transform: scale(0.55) rotate(-210deg);
+      opacity: 0;
+    }
+    35% {
+      opacity: 1;
+    }
+    70% {
+      transform: scale(1.12) rotate(14deg);
     }
     100% {
       transform: scale(1) rotate(0);
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .dice.rolling,
-    .point.last {
+    .die.rolling,
+    .point.last .tri {
       animation: none;
     }
   }

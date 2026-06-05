@@ -8,9 +8,14 @@ mod dto;
 
 use engine_core::analysis::{analyze_cube, CubeContext};
 use engine_core::{
-    best_turn_search, position_equity, BearoffTable, Board, Evaluator, GameState, Net, Player,
-    Rules, Variant,
+    best_turn_search, best_turn_search_budget, position_equity, position_equity_width, BearoffTable,
+    Board, Evaluator, GameState, Net, Player, Rules, Variant, ROOT_WIDTH, SEARCH_WIDTH,
 };
+
+/// Hard leaf-evaluation budget for the 3-ply play search, so Expert stays
+/// responsive (~1.5s) even in bushy doubles positions where an exact search
+/// would take many seconds. Tuned for single-threaded WASM.
+const PLAY_LEAF_BUDGET: u64 = 90_000;
 use wasm_bindgen::prelude::*;
 
 use dto::*;
@@ -113,6 +118,19 @@ impl Engine {
         to_json(&dtos)
     }
 
+    /// Every legal *ordered* sub-move sequence for the current dice, as JSON
+    /// `SequenceDto[]` (`{ moves, turn_id }`). The UI drives click/drag
+    /// move-building by prefix-matching the player's chosen sub-moves against
+    /// these sequences — each is legal at every intermediate step — then commits
+    /// via `applyTurn(turn_id)`. This replaces multiset-matching against the
+    /// deduped turn list, which silently forbade some legal move orderings.
+    #[wasm_bindgen(js_name = legalSequences)]
+    pub fn legal_sequences(&self) -> Result<String, JsError> {
+        let turns = self.game.legal_turns();
+        let seqs = self.game.legal_sequences();
+        to_json(&sequence_dtos(&turns, &seqs))
+    }
+
     /// Apply the turn with the given id; returns the new position JSON.
     #[wasm_bindgen(js_name = applyTurn)]
     pub fn apply_turn(&mut self, id: u32) -> Result<String, JsError> {
@@ -135,9 +153,25 @@ impl Engine {
 
         // Play path uses the net directly: the exact bear-off table costs seconds
         // to build and (per the ER measurement) does not change play strength.
-        let (turn, equity) =
+        // 3-ply (Expert) runs under a leaf budget so it stays fast in bushy
+        // positions; 1–2 ply is small and searched exactly.
+        let (turn, equity) = if ply >= 3 {
+            best_turn_search_budget(
+                &self.net,
+                &self.game.board,
+                mover,
+                dice,
+                first,
+                head_limit,
+                ply,
+                Some(SEARCH_WIDTH),
+                Some(ROOT_WIDTH),
+                PLAY_LEAF_BUDGET,
+            )
+        } else {
             best_turn_search(&self.net, &self.game.board, mover, dice, first, head_limit, ply.max(1))
-                .ok_or_else(|| JsError::new("no legal turn"))?;
+        }
+        .ok_or_else(|| JsError::new("no legal turn"))?;
 
         // id within the canonical legal-turns list
         let turns = self.game.legal_turns();
@@ -185,7 +219,10 @@ impl Engine {
                         net: &self.net,
                         bearoff: self.bearoff.as_ref().unwrap(),
                     };
-                    -position_equity(&eval, &t.board, opp, ply - 1, head_limit)
+                    // Forward-prune deeper nodes for ply>=3 (same bound as the
+                    // play path) so analysis stays responsive; ply==2 is exact.
+                    let width = if ply >= 3 { Some(SEARCH_WIDTH) } else { None };
+                    -position_equity_width(&eval, &t.board, opp, ply - 1, head_limit, width)
                 } else {
                     -op.cubeless_equity()
                 };
@@ -310,6 +347,9 @@ impl Engine {
         game.dice = setup.dice;
         game.first_turn_done = [true, true]; // editor positions are not first turns
         game.crawford = setup.crawford.unwrap_or(false);
+        if let Some(n) = setup.turn_number {
+            game.turn_number = n;
+        }
         if let Some(c) = setup.cube {
             game.cube = engine_core::Cube {
                 value: c.value,
@@ -329,6 +369,15 @@ impl Engine {
     #[wasm_bindgen(js_name = reset)]
     pub fn reset(&mut self) -> Result<String, JsError> {
         self.game = GameState::new(self.game.rules);
+        self.get_position()
+    }
+
+    /// Set which player is on roll (e.g. the winner of the opening-roll for the
+    /// first move). Unlike `setPosition` this preserves the per-player first-turn
+    /// flags, so the head-doubles exception still applies on that player's first move.
+    #[wasm_bindgen(js_name = setTurn)]
+    pub fn set_turn(&mut self, color: &str) -> Result<String, JsError> {
+        self.game.turn = parse_player(color).map_err(js_err)?;
         self.get_position()
     }
 

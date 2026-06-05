@@ -108,6 +108,14 @@ pub struct TurnDto {
     pub moves: Vec<CheckerMoveDto>,
 }
 
+/// One legal *ordered* sub-move sequence (a way to build the turn), with the id of
+/// the deduped legal turn it resolves to so the UI can commit it via `applyTurn`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SequenceDto {
+    pub moves: Vec<CheckerMoveDto>,
+    pub turn_id: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProbabilitiesDto {
     pub win: f32,
@@ -151,6 +159,9 @@ pub struct SetupDto {
     pub dice: Option<[u8; 2]>,
     pub cube: Option<CubeDto>,
     pub crawford: Option<bool>,
+    /// Restore the move counter when resuming a saved game (default: keep 0).
+    #[serde(default)]
+    pub turn_number: Option<u32>,
 }
 
 // ---- conversions ----------------------------------------------------------
@@ -178,8 +189,8 @@ pub fn cube_dto(c: &Cube) -> CubeDto {
     }
 }
 
-pub fn outcome_dto(board: &Board) -> OutcomeDto {
-    match engine_core::outcome(board) {
+pub fn outcome_dto(outcome: Outcome) -> OutcomeDto {
+    match outcome {
         Outcome::Ongoing => OutcomeDto {
             kind: "ongoing".into(),
             winner: None,
@@ -195,6 +206,12 @@ pub fn outcome_dto(board: &Board) -> OutcomeDto {
             winner: Some(player_str(winner)),
             mars: Some(mars),
             points: Some(points),
+        },
+        Outcome::Draw => OutcomeDto {
+            kind: "draw".into(),
+            winner: None,
+            mars: None,
+            points: Some(0),
         },
     }
 }
@@ -222,7 +239,7 @@ pub fn position_dto(game: &GameState) -> PositionDto {
         turn_number: game.turn_number,
         cube: cube_dto(&game.cube),
         crawford: game.crawford,
-        outcome: outcome_dto(b),
+        outcome: outcome_dto(game.outcome()),
     }
 }
 
@@ -250,4 +267,18 @@ pub fn turn_id(turns: &[Turn], chosen: &Turn) -> u32 {
         .iter()
         .position(|t| t.board == chosen.board)
         .unwrap_or(0) as u32
+}
+
+/// Build the UI's ordered-sequence list: every legal ordering of sub-moves, each
+/// tagged with the deduped legal-turn id (board match) it commits to.
+pub fn sequence_dtos(turns: &[Turn], seqs: &[(Vec<CheckerMove>, Board)]) -> Vec<SequenceDto> {
+    seqs.iter()
+        .map(|(moves, board)| SequenceDto {
+            moves: moves.iter().map(move_dto).collect(),
+            turn_id: turns
+                .iter()
+                .position(|t| &t.board == board)
+                .unwrap_or(0) as u32,
+        })
+        .collect()
 }

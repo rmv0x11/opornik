@@ -171,15 +171,33 @@ pub struct CubeAnalysis {
     pub note: &'static str,
 }
 
-// Money-game decision thresholds on cubeless equity. Baseline values; the
-// live-cube (Janowski) and match-equity (MWC) refinements arrive with the net.
-const DOUBLE_POINT: f32 = 0.30;
-const PASS_POINT: f32 = 0.50;
-const TOO_GOOD_POINT: f32 = 1.0;
+/// Cube efficiency for the Janowski live-cube model: 0 = dead cube (you only ever
+/// double to cash), 1 = perfectly efficient (continuous) cube. ~0.7 is a typical
+/// real-game value and reproduces the classic gammonless window (~71%–79%).
+const CUBE_EFFICIENCY: f32 = 0.7;
+/// Above this cubeless equity, cashing throws away too much — play on (тугуд).
+const TOO_GOOD_EQUITY: f32 = 1.0;
+
+/// Average points won when the doubler wins, and lost when they lose, given the
+/// mars (gammon) shares. A plain win is 1 point, a mars 2. Returns `(W, L)`.
+fn win_loss_values(probs: &Probabilities) -> (f32, f32) {
+    let win = probs.win.clamp(1e-4, 1.0 - 1e-4);
+    let w = 1.0 + probs.win_mars.max(0.0) / win;
+    let l = 1.0 + probs.lose_mars.max(0.0) / (1.0 - win);
+    (w, l)
+}
 
 /// Recommend a cube action for the player on roll, given outcome probabilities.
+///
+/// Uses the Janowski live-cube model: the opponent's pass ("cash") point and the
+/// doubler's start-doubling point are derived from the win/loss values `W`/`L`
+/// (so gammons shift the window) and the cube-efficiency parameter, instead of
+/// fixed cubeless-equity thresholds.
 pub fn analyze_cube(probs: &Probabilities, ctx: &CubeContext) -> CubeAnalysis {
-    let equity = if ctx.money && ctx.jacoby && !ctx.cube.turned {
+    // Under the Jacoby rule (money, cube not yet turned) gammons don't count, so
+    // both the equity and the doubling window collapse to the single-game case.
+    let jacoby_single = ctx.money && ctx.jacoby && !ctx.cube.turned;
+    let equity = if jacoby_single {
         probs.cubeless_equity_single()
     } else {
         probs.cubeless_equity()
@@ -204,17 +222,29 @@ pub fn analyze_cube(probs: &Probabilities, ctx: &CubeContext) -> CubeAnalysis {
         };
     }
 
-    let action = if equity <= DOUBLE_POINT {
-        CubeAction::NoDouble
-    } else if equity <= PASS_POINT {
-        CubeAction::DoubleTake
-    } else if equity <= TOO_GOOD_POINT {
-        CubeAction::DoublePass
-    } else {
+    let p = probs.win.clamp(0.0, 1.0);
+    let (w, l) = if jacoby_single { (1.0, 1.0) } else { win_loss_values(probs) };
+    let x = CUBE_EFFICIENCY;
+    let denom = w + l + 0.5 * x;
+    // Opponent passes a double above the cash point; the live cube spreads the
+    // window symmetrically around the dead-cube cash point, giving the start-
+    // doubling point below it.
+    let cash = 1.0 - (w - 0.5) / denom;
+    let cash_dead = 1.0 - (w - 0.5) / (w + l);
+    let double_point = (2.0 * cash_dead - cash).clamp(0.0, cash);
+
+    let too_good = !jacoby_single && equity > TOO_GOOD_EQUITY;
+    let action = if too_good {
         CubeAction::TooGood
+    } else if p >= cash {
+        CubeAction::DoublePass
+    } else if p >= double_point {
+        CubeAction::DoubleTake
+    } else {
+        CubeAction::NoDouble
     };
 
-    let opponent_should_take = equity <= PASS_POINT;
+    let opponent_should_take = p < cash;
     // A double while behind (equity < 0) is a blunder the taker should beaver.
     let recommend_beaver = ctx.money && ctx.beaver && equity < 0.0;
 
@@ -258,8 +288,8 @@ mod tests {
 
     #[test]
     fn strong_lead_is_a_double_and_take() {
-        // equity ~0.4 → in the doubling window, opponent takes.
-        let p = Probabilities { win: 0.70, win_mars: 0.0, lose_mars: 0.0 };
+        // ~75% gammonless sits inside the doubling window (~71%–79%): double, take.
+        let p = Probabilities { win: 0.75, win_mars: 0.0, lose_mars: 0.0 };
         let a = analyze_cube(&p, &money_ctx());
         assert_eq!(a.action, CubeAction::DoubleTake);
         assert!(a.opponent_should_take);
@@ -267,11 +297,35 @@ mod tests {
 
     #[test]
     fn big_lead_is_double_pass_cash() {
-        // equity ~0.6 → opponent must pass.
-        let p = Probabilities { win: 0.80, win_mars: 0.0, lose_mars: 0.0 };
+        // ~82% gammonless is past the cash point → opponent must pass.
+        let p = Probabilities { win: 0.82, win_mars: 0.0, lose_mars: 0.0 };
         let a = analyze_cube(&p, &money_ctx());
         assert_eq!(a.action, CubeAction::DoublePass);
         assert!(!a.opponent_should_take);
+    }
+
+    #[test]
+    fn gammonless_take_and_cash_points_match_theory() {
+        // Classic money references (cube efficiency 0.7): the taker holds a take
+        // down to ~20%, and the doubler cashes once the opponent drops below it
+        // (~79% for the doubler). Probe both sides of the cash point.
+        let just_take = Probabilities { win: 0.78, win_mars: 0.0, lose_mars: 0.0 };
+        assert!(analyze_cube(&just_take, &money_ctx()).opponent_should_take);
+        let just_pass = Probabilities { win: 0.81, win_mars: 0.0, lose_mars: 0.0 };
+        assert!(!analyze_cube(&just_pass, &money_ctx()).opponent_should_take);
+        // Symmetric take point for the doubled side: at ~25% (well above ~20%) a
+        // take is still correct, so the doubler at 75% gets a take, not a pass.
+        assert_eq!(analyze_cube(&just_take, &money_ctx()).action, CubeAction::DoubleTake);
+    }
+
+    #[test]
+    fn gammon_threat_lets_you_double_earlier() {
+        // Same 68% win, but a heavy mars share should pull the doubling point
+        // below it (gammons widen the doubler's window), turning NoDouble → Double.
+        let plain = Probabilities { win: 0.68, win_mars: 0.0, lose_mars: 0.0 };
+        let gammonish = Probabilities { win: 0.68, win_mars: 0.30, lose_mars: 0.0 };
+        assert_eq!(analyze_cube(&plain, &money_ctx()).action, CubeAction::NoDouble);
+        assert_ne!(analyze_cube(&gammonish, &money_ctx()).action, CubeAction::NoDouble);
     }
 
     #[test]

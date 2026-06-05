@@ -218,13 +218,14 @@ fn enumerate(
     (out, max_depth)
 }
 
-/// Filter leaves to the maximal-usage set, apply the larger-die rule and collapse
-/// to distinct resulting positions.
-fn finalize(
+/// Filter raw leaves to the maximal-usage set and apply the larger-die rule,
+/// **keeping every ordering** (no board dedup). Shared basis for both the
+/// canonical deduped turn list and the raw-sequence list that drives the UI.
+fn select_maximal(
     leaves: Vec<(Vec<CheckerMove>, Board)>,
     dice: [u8; 2],
     max_depth: usize,
-) -> Vec<Turn> {
+) -> Vec<(Vec<CheckerMove>, Board)> {
     let mut kept: Vec<(Vec<CheckerMove>, Board)> =
         leaves.into_iter().filter(|(m, _)| m.len() == max_depth).collect();
 
@@ -236,8 +237,41 @@ fn finalize(
             kept.retain(|(m, _)| m[0].die == larger);
         }
     }
+    kept
+}
 
-    // Distinct resulting positions only (merges transposing orderings).
+/// The maximal leaf set (every legal ordering) for a roll under a head limit,
+/// applying the first-turn doubles exception exactly as [`generate_turns_cfg`].
+/// Each entry is one fully-legal ordered sub-move sequence and its resulting
+/// board; transposing orderings are **not** merged (unlike the turn list).
+fn maximal_leaves(
+    board: &Board,
+    player: Player,
+    dice: [u8; 2],
+    first_turn: bool,
+    head_limit: Option<u8>,
+) -> Vec<(Vec<CheckerMove>, Board)> {
+    let base_budget = head_limit.unwrap_or(u8::MAX);
+    let (base_leaves, base_depth) = enumerate(board, player, dice, base_budget);
+
+    // First-turn exception: only at head limit 1, only for 3-3/4-4/6-6, and only
+    // if a second head checker strictly increases the number of dice played.
+    if head_limit == Some(1)
+        && first_turn
+        && dice[0] == dice[1]
+        && HEAD_EXCEPTION_DOUBLES.contains(&dice[0])
+    {
+        let (ex_leaves, ex_depth) = enumerate(board, player, dice, 2);
+        if ex_depth > base_depth {
+            return select_maximal(ex_leaves, dice, ex_depth);
+        }
+    }
+    select_maximal(base_leaves, dice, base_depth)
+}
+
+/// Collapse maximal leaves to distinct resulting positions (merging transposing
+/// orderings) — the canonical legal-turn list.
+fn dedup_to_turns(kept: Vec<(Vec<CheckerMove>, Board)>) -> Vec<Turn> {
     let mut seen: HashSet<Board> = HashSet::new();
     let mut turns = Vec::with_capacity(kept.len());
     for (m, b) in kept {
@@ -274,23 +308,29 @@ pub fn generate_turns_cfg(
     first_turn: bool,
     head_limit: Option<u8>,
 ) -> Vec<Turn> {
-    let base_budget = head_limit.unwrap_or(u8::MAX);
-    let (base_leaves, base_depth) = enumerate(board, player, dice, base_budget);
+    dedup_to_turns(maximal_leaves(board, player, dice, first_turn, head_limit))
+}
 
-    // First-turn exception: only at head limit 1, only for 3-3/4-4/6-6, and only
-    // if a second head checker strictly increases the number of dice played.
-    if head_limit == Some(1)
-        && first_turn
-        && dice[0] == dice[1]
-        && HEAD_EXCEPTION_DOUBLES.contains(&dice[0])
-    {
-        let (ex_leaves, ex_depth) = enumerate(board, player, dice, 2);
-        if ex_depth > base_depth {
-            return finalize(ex_leaves, dice, ex_depth);
-        }
-    }
-
-    finalize(base_leaves, dice, base_depth)
+/// Every **legal ordered sub-move sequence** for a roll (all orderings kept), each
+/// paired with its resulting board. Unlike [`generate_turns_cfg`], transposing
+/// orderings that reach the same board are **not** merged — so choosing the dice
+/// in a different (still legal) order is fully represented. Each sequence is legal
+/// at every intermediate step, because the generator enforces the head rule,
+/// blocked landings, the *transient* full-prime ban and the bear-off over-roll
+/// rule on every board along the way. This is exactly what an interactive UI needs
+/// to drive move-building (offer only the legal next sub-move), closing the whole
+/// class of move-ordering bugs that multiset-matching against the deduped turn
+/// list leaves open.
+///
+/// A forced pass yields a single entry with empty moves and the unchanged board.
+pub fn legal_sequences(
+    board: &Board,
+    player: Player,
+    dice: [u8; 2],
+    first_turn: bool,
+    head_limit: Option<u8>,
+) -> Vec<(Vec<CheckerMove>, Board)> {
+    maximal_leaves(board, player, dice, first_turn, head_limit)
 }
 
 #[cfg(test)]
@@ -530,5 +570,278 @@ mod tests {
         // ...which is impossible under the standard head limit of 1.
         let std = generate_turns_cfg(&b, Player::White, [1, 1], false, Some(1));
         assert!(std.iter().all(|t| t.board.own_at(Player::White, HEAD_POS) >= N_CHECKERS - 1));
+    }
+
+    #[test]
+    fn first_turn_black_six_four_takes_at_most_one_off_head() {
+        // Regression for the live "24/20 19/13" bug report: 6-4 is NOT a double, so
+        // the first-turn head exception must NOT apply; at most ONE black checker
+        // may leave the head (pos 24). The correct play is a single-checker chain
+        // 24/20/14, never two distinct checkers off the head.
+        let b = Board::starting();
+        let ts = turns(&b, Player::Black, [6, 4], true);
+        assert!(!ts.is_empty(), "must generate at least one legal turn");
+        for t in &ts {
+            let off_head = t.moves.iter().filter(|m| m.from == HEAD_POS).count();
+            assert!(
+                off_head <= 1,
+                "turn {:?} takes {off_head} checkers off the head (head rule = 1)",
+                t.moves
+            );
+            assert_eq!(
+                t.board.own_at(Player::Black, HEAD_POS),
+                N_CHECKERS - 1,
+                "turn {:?} must leave exactly 14 checkers on the head",
+                t.moves
+            );
+        }
+    }
+
+    #[test]
+    fn bug_report_no_overshoot_bearoff_from_pt1_while_pt3_occupied() {
+        // Reproduces a player bug report: White home has checkers ONLY on point 1
+        // (2 checkers) and point 3 (1 checker); 12 already borne off (total 15).
+        // Dice 2-2 (four 2s). A die of 2 must NOT bear off:
+        //   * point 2 is empty -> no exact bear-off,
+        //   * point 1 with a 2 is an over-roll, legal only if no checker on a
+        //     higher point (2..6) -> but point 3 is occupied, so illegal,
+        //   * point 3 with a 2 (2 < 3) is a plain move 3->1, never a bear-off.
+        // The only legal first sub-move is 3->1. Only AFTER point 3 is cleared may
+        // point 1 bear off with a 2.
+        let mut b = Board::empty();
+        b.place(Player::White, 1, 2);
+        b.place(Player::White, 3, 1);
+        b.off[Player::White.index()] = 12;
+        // Black: give a valid 15 (all borne off is fine and irrelevant here).
+        b.off[Player::Black.index()] = N_CHECKERS;
+        assert!(b.is_valid(), "white 2+1 on board + 12 off = 15; black 15 off");
+
+        let ts = generate_turns_cfg(&b, Player::White, [2, 2], false, Some(1));
+
+        // Validate EVERY generated turn by simulating its sub-moves IN ORDER on a
+        // fresh board, asserting no illegal bear-off occurs at any step.
+        for (i, t) in ts.iter().enumerate() {
+            let mut sim = b.clone();
+            for (j, m) in t.moves.iter().enumerate() {
+                assert!(
+                    sim.own_at(Player::White, m.from) > 0,
+                    "turn[{i}] submove[{j}] {:?}: no checker on from={}",
+                    m,
+                    m.from
+                );
+                if m.bear_off {
+                    let highest = sim.highest_occupied(Player::White);
+                    let exact = m.die == m.from;
+                    assert!(
+                        m.die >= m.from,
+                        "turn[{i}] submove[{j}] {:?}: illegal under-roll bear-off (die {} < from {})",
+                        m,
+                        m.die,
+                        m.from
+                    );
+                    if !exact {
+                        assert_eq!(
+                            highest, m.from,
+                            "turn[{i}] submove[{j}] {:?}: over-roll bear-off from {} while highest occupied is {}",
+                            m, m.from, highest
+                        );
+                    }
+                    if m.from == 1 {
+                        assert_eq!(
+                            sim.own_at(Player::White, 3),
+                            0,
+                            "turn[{i}] submove[{j}] {:?}: bear-off from pt1 while pt3 still occupied",
+                            m
+                        );
+                    }
+                    sim.remove(Player::White, m.from);
+                    sim.off[Player::White.index()] += 1;
+                } else {
+                    assert_eq!(
+                        m.to,
+                        m.from - m.die,
+                        "turn[{i}] submove[{j}] {:?}: to != from-die",
+                        m
+                    );
+                    sim.remove(Player::White, m.from);
+                    sim.add(Player::White, m.to);
+                }
+            }
+            assert_eq!(sim, t.board, "turn[{i}] simulated board diverges from engine board");
+        }
+
+        // Every legal turn's FIRST sub-move must be 3->1 (the only legal opener).
+        for (i, t) in ts.iter().enumerate() {
+            assert!(!t.is_pass(), "turn[{i}] must not be a pass");
+            let first = t.moves[0];
+            assert!(!first.bear_off, "turn[{i}] opens with an (illegal) bear-off: {:?}", first);
+            assert_eq!(first.from, 3, "turn[{i}] first sub-move must come from pt3");
+            assert_eq!(first.to, 1, "turn[{i}] first sub-move must be 3->1");
+        }
+    }
+
+    #[test]
+    fn legal_sequences_keep_transposing_orderings() {
+        // One White checker on pos 10, dice 3-1, open board. Reaching pos 6 has two
+        // legal orderings — 10/7/6 (play the 3 first) and 10/9/6 (play the 1 first)
+        // — that transpose to the SAME board. The deduped turn list keeps ONE; the
+        // raw sequence list keeps BOTH, so the UI can offer either die first. This
+        // is the exact case where the old multiset-matching UI silently forbade an
+        // ordering.
+        let mut b = Board::empty();
+        b.place(Player::White, 10, 1);
+
+        let turns = generate_turns(&b, Player::White, [3, 1], false);
+        assert_eq!(turns.len(), 1, "one distinct resulting position");
+
+        let seqs = legal_sequences(&b, Player::White, [3, 1], false, Some(1));
+        assert_eq!(seqs.len(), 2, "both legal orderings are present");
+        for (_m, board) in &seqs {
+            assert_eq!(board.own_at(Player::White, 6), 1, "both reach pos 6");
+        }
+        let first_dice: HashSet<u8> = seqs.iter().map(|(m, _)| m[0].die).collect();
+        assert_eq!(
+            first_dice,
+            [1u8, 3].into_iter().collect::<HashSet<u8>>(),
+            "the two orderings differ in which die is played first"
+        );
+    }
+
+    #[test]
+    fn legal_sequences_enforce_larger_die_rule() {
+        // Lone checker on pos 13; Black blocks White's pos 6; dice 6-1. Only the 6
+        // is playable (13 -> 7); the sequence list must contain exactly that move.
+        let mut b = Board::empty();
+        b.place(Player::White, 13, 1);
+        b.place_phys(Player::Black, phys(Player::White, 6), 1);
+
+        let seqs = legal_sequences(&b, Player::White, [6, 1], false, Some(1));
+        assert_eq!(seqs.len(), 1);
+        assert_eq!(seqs[0].0.len(), 1);
+        assert_eq!(seqs[0].0[0].die, 6);
+        assert_eq!(seqs[0].1.own_at(Player::White, 7), 1);
+    }
+
+    #[test]
+    fn legal_sequences_respect_bearoff_overshoot_order() {
+        // The bear-off bug position: White 2 on pt1, 1 on pt3, 12 off, dice 2-2.
+        // EVERY legal ordering must OPEN with 3->1 (the only legal first sub-move);
+        // pt1 may bear off only after pt3 clears. (Drives the UI source highlight.)
+        let mut b = Board::empty();
+        b.place(Player::White, 1, 2);
+        b.place(Player::White, 3, 1);
+        b.off[Player::White.index()] = 12;
+
+        let seqs = legal_sequences(&b, Player::White, [2, 2], false, Some(1));
+        assert!(!seqs.is_empty());
+        for (m, _) in &seqs {
+            assert!(!m.is_empty(), "no pass — there is a legal move");
+            assert_eq!(m[0].from, 3, "first sub-move must come from pt3");
+            assert_eq!(m[0].to, 1, "first sub-move must be 3->1");
+            assert!(!m[0].bear_off, "must not open with a bear-off");
+        }
+    }
+
+    #[test]
+    fn every_legal_sequence_simulates_to_its_recorded_board() {
+        // Invariant: simulating each sequence's sub-moves IN ORDER reproduces its
+        // recorded board and conserves checkers — i.e. every ordering the UI may
+        // build is internally consistent and legal step by step.
+        let b = Board::starting();
+        for dice in [[6, 5], [3, 1], [2, 2], [6, 6], [4, 4]] {
+            for (moves, board) in legal_sequences(&b, Player::White, dice, true, Some(1)) {
+                let mut sim = b.clone();
+                for m in &moves {
+                    assert!(
+                        sim.own_at(Player::White, m.from) > 0,
+                        "dice {dice:?}: sub-move {m:?} from an empty point"
+                    );
+                    sim.remove(Player::White, m.from);
+                    if m.bear_off {
+                        sim.off[Player::White.index()] += 1;
+                    } else {
+                        sim.add(Player::White, m.to);
+                    }
+                }
+                assert_eq!(sim, board, "dice {dice:?}: simulated board diverges");
+                let total =
+                    sim.checkers_on_board(Player::White) + sim.off[Player::White.index()];
+                assert_eq!(total, N_CHECKERS, "dice {dice:?}: checkers not conserved");
+            }
+        }
+    }
+
+    #[test]
+    fn legal_sequences_are_consistent_on_random_positions() {
+        // Deterministic pseudo-random WHITE positions over many rolls. Asserts that
+        // (a) every sequence simulates step-by-step to its recorded board, and
+        // (b) the SET of boards reachable via sequences equals the deduped turn
+        // list — i.e. the UI's prefix-walk over sequences can build exactly the
+        // legal turns, no more, no fewer. Exercises ordering / bear-off / head edge
+        // cases on far more shapes than the crafted unit tests.
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        let dice_opts = [
+            [6, 5],
+            [3, 1],
+            [2, 2],
+            [6, 6],
+            [5, 4],
+            [4, 4],
+            [6, 1],
+            [2, 1],
+        ];
+
+        for _ in 0..600 {
+            let mut b = Board::empty();
+            let home_only = next() % 3 == 0; // ~1/3 all-home → exercise bear-off
+            let n = 3 + (next() % 6) as u8; // 3..=8 checkers
+            let mut placed = 0u8;
+            for _ in 0..n {
+                let pos = if home_only {
+                    1 + (next() % 6) as u8
+                } else {
+                    1 + (next() % 24) as u8
+                };
+                b.place(Player::White, pos, b.own_at(Player::White, pos) + 1);
+                placed += 1;
+            }
+            if home_only {
+                b.off[Player::White.index()] = N_CHECKERS - placed;
+            }
+            let dice = dice_opts[(next() as usize) % dice_opts.len()];
+
+            let turns = generate_turns_cfg(&b, Player::White, dice, false, Some(1));
+            let seqs = legal_sequences(&b, Player::White, dice, false, Some(1));
+
+            for (moves, board) in &seqs {
+                let mut sim = b.clone();
+                for m in moves {
+                    assert!(
+                        sim.own_at(Player::White, m.from) > 0,
+                        "sub-move from an empty point on random board {b:?}"
+                    );
+                    sim.remove(Player::White, m.from);
+                    if m.bear_off {
+                        sim.off[Player::White.index()] += 1;
+                    } else {
+                        sim.add(Player::White, m.to);
+                    }
+                }
+                assert_eq!(&sim, board, "sequence diverges on {b:?} dice {dice:?}");
+            }
+
+            let seq_boards: HashSet<Board> = seqs.into_iter().map(|(_, brd)| brd).collect();
+            let turn_boards: HashSet<Board> = turns.into_iter().map(|t| t.board).collect();
+            assert_eq!(
+                seq_boards, turn_boards,
+                "reachable boards != legal turns on {b:?} dice {dice:?}"
+            );
+        }
     }
 }

@@ -118,6 +118,8 @@ pub fn self_play_episode(net: &mut Net, rng: &mut Rng, lr: f32, explore: f32) ->
                 net.train_step(&x_t, &win_target(mars), lr);
                 return ply + 1;
             }
+            // board-only `outcome` never yields Draw (training uses Traditional rules)
+            Outcome::Draw => return ply + 1,
             Outcome::Ongoing => {
                 // Bootstrap: target = net(s_{t+1}) viewed from the mover's side.
                 let opp = mover.opponent();

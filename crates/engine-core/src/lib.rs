@@ -48,7 +48,12 @@ pub use encoding::{encode, INPUT_SIZE};
 pub use eval::{evaluate, WIN_SCORE};
 pub use game::{outcome, GameState, Outcome, Rules, Variant};
 pub use matchplay::{MatchState, MoneyGame, STANDARD_MATCH_LENGTHS};
-pub use moves::{creates_illegal_prime, generate_turns, generate_turns_cfg, CheckerMove, Turn};
+pub use moves::{
+    creates_illegal_prime, generate_turns, generate_turns_cfg, legal_sequences, CheckerMove, Turn,
+};
 pub use net::{Net, OUTPUTS};
 pub use player::Player;
-pub use search::{best_turn_search, position_equity, Composite, Evaluator, Heuristic};
+pub use search::{
+    best_turn_search, best_turn_search_budget, best_turn_search_width, position_equity,
+    position_equity_width, Composite, Evaluator, Heuristic, ROOT_WIDTH, SEARCH_WIDTH,
+};

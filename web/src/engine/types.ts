@@ -18,7 +18,7 @@ export interface CubeDto {
 }
 
 export interface OutcomeDto {
-  kind: 'ongoing' | 'win';
+  kind: 'ongoing' | 'win' | 'draw';
   winner: PlayerColor | null;
   mars: boolean | null;
   points: number | null;
@@ -50,6 +50,13 @@ export interface TurnDto {
   id: number;
   is_pass: boolean;
   moves: CheckerMoveDto[];
+}
+
+// One legal ordered sub-move sequence (a way to build the turn) + the deduped
+// legal-turn id it commits to. Drives click/drag move-building.
+export interface SequenceDto {
+  moves: CheckerMoveDto[];
+  turn_id: number;
 }
 
 export interface ProbabilitiesDto {
@@ -90,4 +97,5 @@ export interface SetupDto {
   dice: [number, number] | null;
   cube: CubeDto | null;
   crawford: boolean | null;
+  turn_number?: number; // restore the move counter when resuming
 }

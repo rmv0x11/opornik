@@ -68,6 +68,7 @@ fn self_play_games_terminate_with_a_winner() {
                 }
                 total_turns += turns;
             }
+            Outcome::Draw => total_turns += turns,
             Outcome::Ongoing => panic!("game {seed} did not finish"),
         }
     }

@@ -13,7 +13,17 @@ self.onmessage = async (e: MessageEvent) => {
   try {
     if (cmd === 'init') {
       if (!wasmReady) {
-        await init(wasmUrl);
+        // Load the wasm as BYTES and instantiate directly, rather than letting
+        // wasm-bindgen use WebAssembly.instantiateStreaming. iOS Safari/WebKit can
+        // reject instantiateStreaming with "Unexpected response MIME type. Expected
+        // 'application/wasm'" even when the server's Content-Type IS correct (a
+        // WebKit bug, notably inside Web Workers). Because the MIME is correct,
+        // wasm-bindgen's own fallback does NOT trigger and the error is re-thrown,
+        // crashing the app on iPhone. Passing bytes uses WebAssembly.instantiate
+        // (no MIME check) and works on every browser. (Chrome/Android were fine
+        // because their instantiateStreaming is lenient.)
+        const wasmBytes = await fetch(wasmUrl).then((r) => r.arrayBuffer());
+        await init({ module_or_path: wasmBytes });
         wasmReady = true;
       }
       // (Re)create the engine for the chosen variant.
@@ -31,6 +41,9 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       case 'legalTurns':
         res = JSON.parse(eng.legalTurns());
+        break;
+      case 'legalSequences':
+        res = JSON.parse(eng.legalSequences());
         break;
       case 'applyTurn':
         res = JSON.parse(eng.applyTurn(args.id));
@@ -64,6 +77,9 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       case 'reset':
         res = JSON.parse(eng.reset());
+        break;
+      case 'setTurn':
+        res = JSON.parse(eng.setTurn(args.color));
         break;
       case 'setCrawford':
         res = JSON.parse(eng.setCrawford(args.on));

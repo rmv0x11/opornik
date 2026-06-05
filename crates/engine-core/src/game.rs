@@ -3,7 +3,7 @@
 use crate::board::Board;
 use crate::board::N_CHECKERS;
 use crate::cube::{Cube, CubeError};
-use crate::moves::{generate_turns_cfg, Turn};
+use crate::moves::{generate_turns_cfg, legal_sequences, CheckerMove, Turn};
 use crate::player::Player;
 
 /// Long-nardy rule variant.
@@ -119,6 +119,8 @@ pub enum Outcome {
         /// Points awarded: 1 for оин, 2 for марс.
         points: u8,
     },
+    /// Both players borne off all 15 (Classic last-roll equalisation).
+    Draw,
 }
 
 /// Static scoring of a board, independent of whose turn it is.
@@ -154,6 +156,12 @@ pub struct GameState {
     /// Whether the current game is the Crawford game (no doubling). Set by the
     /// match layer; the engine just honours it.
     pub crawford: bool,
+    /// Who moved first this game (captured on the opening move) — Classic gives the
+    /// *second* mover the equalising last roll, so the order matters.
+    pub first_mover: Option<Player>,
+    /// In Classic, after the first-mover bears off all 15, this is the opponent who
+    /// still owes one equalising turn (a draw is possible until they take it).
+    pub equalizer_for: Option<Player>,
 }
 
 impl GameState {
@@ -168,6 +176,8 @@ impl GameState {
             rules,
             cube: Cube::centered(),
             crawford: false,
+            first_mover: None,
+            equalizer_for: None,
         }
     }
 
@@ -215,19 +225,73 @@ impl GameState {
         }
     }
 
+    /// Every legal *ordered* sub-move sequence for the side to move with the
+    /// currently set dice, each paired with its resulting board. Unlike
+    /// [`Self::legal_turns`], transposing orderings are not merged — so an
+    /// interactive UI can offer the legal next sub-move for any order the player
+    /// builds. Empty if no dice are set.
+    pub fn legal_sequences(&self) -> Vec<(Vec<CheckerMove>, Board)> {
+        match self.dice {
+            Some(dice) => {
+                let first = self.is_first_turn() && self.rules.head_doubles_exception;
+                legal_sequences(&self.board, self.turn, dice, first, self.rules.head_limit)
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Apply a chosen turn: advances the board, marks the first turn done, clears
     /// dice and passes the move to the opponent.
     pub fn apply_turn(&mut self, turn: &Turn) {
+        let mover = self.turn;
+        if self.turn_number == 0 {
+            self.first_mover = Some(mover); // the opening move of the game
+        }
         self.board = turn.board.clone();
-        self.first_turn_done[self.turn.index()] = true;
+        self.first_turn_done[mover.index()] = true;
         self.turn_number += 1;
         self.dice = None;
-        self.turn = self.turn.opponent();
+        // Classic last-roll equalisation bookkeeping.
+        if self.rules.allow_final_draw {
+            let opp = mover.opponent();
+            let mover_done = self.board.off[mover.index()] == N_CHECKERS;
+            let opp_done = self.board.off[opp.index()] == N_CHECKERS;
+            if self.equalizer_for == Some(mover) {
+                // the owed equalising turn was just played → resolve the outcome
+                self.equalizer_for = None;
+            } else if mover_done && !opp_done && self.first_mover == Some(mover) {
+                // the first-mover finished first → the opponent gets one last roll
+                self.equalizer_for = Some(opp);
+            }
+        }
+        self.turn = mover.opponent();
     }
 
-    /// Current outcome.
+    /// Current outcome (Classic-aware: a finished position may still be Ongoing
+    /// while the opponent owes their equalising turn, or end in a Draw).
     pub fn outcome(&self) -> Outcome {
-        outcome(&self.board)
+        if !self.rules.allow_final_draw {
+            return outcome(&self.board);
+        }
+        let w = self.board.off[Player::White.index()] == N_CHECKERS;
+        let b = self.board.off[Player::Black.index()] == N_CHECKERS;
+        if w && b {
+            return Outcome::Draw;
+        }
+        if w || b {
+            let winner = if w { Player::White } else { Player::Black };
+            let opp = winner.opponent();
+            if self.equalizer_for == Some(opp) {
+                return Outcome::Ongoing; // opponent still owes the equalising turn
+            }
+            let mars = self.board.off[opp.index()] == 0;
+            return Outcome::Win {
+                winner,
+                mars,
+                points: if mars { 2 } else { 1 },
+            };
+        }
+        Outcome::Ongoing
     }
 
     /// Whether the game is over.
@@ -275,6 +339,57 @@ mod tests {
                 points: 2
             }
         );
+    }
+
+    fn board_off(white_off: u8, black_off: u8, black_on: Option<(u8, u8)>) -> Board {
+        let mut b = Board::empty();
+        b.off = [white_off, black_off];
+        if let Some((pt, n)) = black_on {
+            b.place(Player::Black, pt, n);
+        }
+        b
+    }
+
+    #[test]
+    fn classic_first_mover_finish_gives_opponent_an_equalising_turn() {
+        let mut g = GameState::new(Rules::for_variant(Variant::Classic));
+        g.turn = Player::White; // White is the opening (first) mover
+        // White bears off the 15th; Black still has one checker (14 off).
+        g.apply_turn(&Turn { moves: vec![], board: board_off(15, 14, Some((1, 1))) });
+        assert_eq!(g.first_mover, Some(Player::White));
+        assert_eq!(g.equalizer_for, Some(Player::Black));
+        // Not over yet — Black owes the equalising roll.
+        assert_eq!(g.outcome(), Outcome::Ongoing);
+        assert_eq!(g.turn, Player::Black);
+
+        // Black also bears off everything on the equaliser → draw.
+        g.apply_turn(&Turn { moves: vec![], board: board_off(15, 15, None) });
+        assert_eq!(g.outcome(), Outcome::Draw);
+    }
+
+    #[test]
+    fn classic_failed_equaliser_is_a_win() {
+        let mut g = GameState::new(Rules::for_variant(Variant::Classic));
+        g.turn = Player::White;
+        g.apply_turn(&Turn { moves: vec![], board: board_off(15, 14, Some((1, 1))) });
+        // Black fails to bear off the last → White wins (оин).
+        g.apply_turn(&Turn { moves: vec![], board: board_off(15, 14, Some((1, 1))) });
+        assert_eq!(
+            g.outcome(),
+            Outcome::Win { winner: Player::White, mars: false, points: 1 }
+        );
+    }
+
+    #[test]
+    fn classic_second_mover_finish_wins_immediately() {
+        // If the SECOND mover finishes first, no equaliser — immediate win.
+        let mut g = GameState::new(Rules::for_variant(Variant::Classic));
+        g.first_mover = Some(Player::Black);
+        g.turn_number = 5; // not the opening move, so first_mover stays Black
+        g.turn = Player::White;
+        g.apply_turn(&Turn { moves: vec![], board: board_off(15, 10, Some((2, 5))) });
+        assert_eq!(g.equalizer_for, None);
+        assert!(matches!(g.outcome(), Outcome::Win { winner: Player::White, .. }));
     }
 
     #[test]

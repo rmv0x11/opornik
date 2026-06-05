@@ -404,9 +404,72 @@
     if (completeSeq) void play(completeSeq.turn_id, true);
   }
 
-  function rollDie() {
-    return 1 + Math.floor(Math.random() * 6);
+  // ---- provably-fair dice ----
+  // A d6 from the platform CSPRNG (crypto.getRandomValues) with REJECTION SAMPLING
+  // to remove modulo bias entirely: a byte is 0..255; 252 = 6×42, so 0..251 map
+  // uniformly to faces 1..6 (42 byte-values each) and 252..255 are rejected and
+  // redrawn. Result: every face is EXACTLY 1/6, and the source is cryptographically
+  // strong (unpredictable, unseedable). Math.random is only a fallback — it's
+  // statistically uniform but a non-crypto PRNG with a (negligible) multiply bias.
+  const dieBuf = new Uint8Array(1);
+  function rollDie(): number {
+    const c = globalThis.crypto;
+    let face: number;
+    if (c && c.getRandomValues) {
+      let v: number;
+      do {
+        c.getRandomValues(dieBuf);
+        v = dieBuf[0];
+      } while (v >= 252);
+      face = (v % 6) + 1;
+    } else {
+      face = 1 + Math.floor(Math.random() * 6);
+    }
+    bumpDiceStat(face);
+    return face;
   }
+
+  // Per-face counts of EVERY die thrown (you + the engine), accumulated across the
+  // session in localStorage so fairness can be checked over a large sample.
+  const DICE_KEY = 'opornik.diceStats';
+  function loadDiceStats(): number[] {
+    try {
+      const raw = localStorage.getItem(DICE_KEY);
+      if (raw) {
+        const a = JSON.parse(raw);
+        if (Array.isArray(a) && a.length === 7) return a.map((n) => Number(n) || 0);
+      }
+    } catch {
+      /* ignore */
+    }
+    return [0, 0, 0, 0, 0, 0, 0]; // index 1..6 used
+  }
+  let diceStats = $state<number[]>(loadDiceStats());
+  let fairOpen = $state(false);
+  function bumpDiceStat(face: number) {
+    diceStats[face] += 1;
+    try {
+      localStorage.setItem(DICE_KEY, JSON.stringify(diceStats));
+    } catch {
+      /* ignore */
+    }
+  }
+  function resetDiceStats() {
+    diceStats = [0, 0, 0, 0, 0, 0, 0];
+    try {
+      localStorage.removeItem(DICE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+  const diceTotal = $derived(diceStats.reduce((a, b) => a + b, 0));
+  // Largest deviation of any face from the ideal 1/6 (a quick fairness read-out).
+  const diceMaxDev = $derived.by(() => {
+    if (diceTotal === 0) return 0;
+    let m = 0;
+    for (let f = 1; f <= 6; f++) m = Math.max(m, Math.abs(diceStats[f] / diceTotal - 1 / 6));
+    return m * 100;
+  });
   // Signed equity, e.g. +0.412 / −0.683 (− is a real minus glyph for alignment).
   function fmtEq(e: number): string {
     return (e >= 0 ? '+' : '−') + Math.abs(e).toFixed(3);
@@ -1472,6 +1535,48 @@
           {/if}
         </div>
       {/if}
+
+      {#if diceTotal > 0}
+        <div class="dicefair" class:open={fairOpen}>
+          <button
+            type="button"
+            class="fair-summary"
+            aria-expanded={fairOpen}
+            onclick={() => (fairOpen = !fairOpen)}
+          >
+            🎲 Честность костей ({diceTotal})
+            <span class="gl-caret">{fairOpen ? '▾' : '▸'}</span>
+          </button>
+          {#if fairOpen}
+            <div class="fairbody">
+              <p class="fairnote">
+                Кости — из криптогенератора (<code>crypto.getRandomValues</code>) с
+                rejection-sampling: каждая грань строго 1/6 (16.7%), источник
+                непредсказуем. Считаются все броски — ваши и движка.
+              </p>
+              <ol class="facebars">
+                {#each [1, 2, 3, 4, 5, 6] as f}
+                  {@const cnt = diceStats[f]}
+                  {@const pct = diceTotal ? (cnt / diceTotal) * 100 : 0}
+                  <li>
+                    <span class="face">{f}</span>
+                    <span class="bar"
+                      ><span class="barfill" style="width: {Math.min(100, (pct / 33) * 100)}%"
+                      ></span></span
+                    >
+                    <span class="cnt">{cnt}</span>
+                    <span class="pct">{pct.toFixed(1)}%</span>
+                  </li>
+                {/each}
+              </ol>
+              <div class="fairfoot">
+                <span class="fairdev">макс. отклонение от 16.7%: {diceMaxDev.toFixed(1)}%</span>
+                <button type="button" class="ghost" onclick={resetDiceStats}>Сбросить</button>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
   {:else}
     <p class="status">{status}</p>
@@ -2099,6 +2204,92 @@
     border: 1px solid #e2d3bb;
     border-radius: 8px;
     background: #fcf8f1;
+  }
+  /* dice-fairness panel */
+  .dicefair {
+    margin-top: 0.7rem;
+    border: 1px solid #e2d3bb;
+    border-radius: 8px;
+    background: #fcf8f1;
+  }
+  .fair-summary {
+    display: block;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    padding: 0.5rem 0.7rem;
+    font: var(--fw-semi) 0.95rem var(--font-ui);
+    color: #6b4423;
+    background: none;
+    border: none;
+    border-radius: 8px;
+  }
+  .fair-summary:hover {
+    background: #f6efe2;
+  }
+  .fairbody {
+    padding: 0 0.7rem 0.6rem;
+  }
+  .fairnote {
+    margin: 0 0 0.55rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    line-height: 1.45;
+  }
+  .fairnote code {
+    font: 0.74rem var(--font-mono);
+    color: #6b4423;
+  }
+  .facebars {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    font: 0.84rem var(--font-mono);
+    font-variant-numeric: var(--num-tabular);
+  }
+  .facebars li {
+    display: grid;
+    grid-template-columns: 1.2rem 1fr 2.6rem 3rem;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.13rem 0;
+  }
+  .facebars .face {
+    font-weight: 700;
+    color: #6b4423;
+    text-align: center;
+  }
+  .facebars .bar {
+    height: 10px;
+    background: var(--surface-sunken);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .facebars .barfill {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, var(--wood-hi), var(--wood));
+    border-radius: 5px;
+    transition: width var(--dur-base) var(--ease-out);
+  }
+  .facebars .cnt {
+    text-align: right;
+    color: #888;
+  }
+  .facebars .pct {
+    text-align: right;
+    color: #3a2e1c;
+    font-weight: 600;
+  }
+  .fairfoot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .fairdev {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
   }
   .gl-head {
     display: flex;

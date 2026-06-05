@@ -15,6 +15,9 @@ use engine_core::net::Net;
 use engine_core::player::Player;
 use engine_core::search::{best_turn_search, Evaluator};
 
+/// Sparring + agreement/ER tooling for benchmarking against LogasAI.
+pub mod logasai;
+
 /// Standard FSNR head limit used throughout training/benchmarking.
 const HEAD_LIMIT: Option<u8> = Some(1);
 /// Safety cap on episode length (a race always resolves well within this).
@@ -58,6 +61,9 @@ pub struct TrainConfig {
     /// Probability of a random (exploratory) move during self-play.
     pub explore: f32,
     pub seed: u64,
+    /// Search depth used to SELECT moves during self-play (1 = greedy 1-ply, the
+    /// classic TD(0); >1 = stronger behaviour policy à la TD-Gammon 2.0, slower).
+    pub selfplay_plies: u8,
 }
 
 impl Default for TrainConfig {
@@ -68,6 +74,7 @@ impl Default for TrainConfig {
             lr: 0.05,
             explore: 0.05,
             seed: 0xC0FFEE,
+            selfplay_plies: 1,
         }
     }
 }
@@ -94,7 +101,16 @@ fn win_target(mars: bool) -> [f32; 3] {
 }
 
 /// Play one self-play game, applying TD updates in place. Returns the game length.
-pub fn self_play_episode(net: &mut Net, rng: &mut Rng, lr: f32, explore: f32) -> usize {
+/// `plies` is the move-selection search depth (1 = greedy; >1 = deeper behaviour
+/// policy). The TD target stays a 1-ply bootstrap (cheap); only the *play* is
+/// stronger, which shifts training toward better state distributions.
+pub fn self_play_episode(
+    net: &mut Net,
+    rng: &mut Rng,
+    lr: f32,
+    explore: f32,
+    plies: u8,
+) -> usize {
     let mut board = Board::starting();
     let mut mover = Player::White;
     let mut first = [true, true];
@@ -102,15 +118,20 @@ pub fn self_play_episode(net: &mut Net, rng: &mut Rng, lr: f32, explore: f32) ->
     for ply in 0..MAX_PLIES {
         let x_t = encode(&board, mover);
         let dice = rng.dice();
-        let turns = generate_turns_cfg(&board, mover, dice, first[mover.index()], HEAD_LIMIT);
+        let fst = first[mover.index()];
+        let turns = generate_turns_cfg(&board, mover, dice, fst, HEAD_LIMIT);
         first[mover.index()] = false;
 
-        let idx = if explore > 0.0 && rng.unit() < explore {
-            (rng.next_u64() as usize) % turns.len()
+        let next_board = if explore > 0.0 && rng.unit() < explore {
+            turns[(rng.next_u64() as usize) % turns.len()].board.clone()
+        } else if plies > 1 {
+            // deeper move selection (expectiminimax) — stronger behaviour policy
+            best_turn_search(&*net, &board, mover, dice, fst, HEAD_LIMIT, plies)
+                .map(|(t, _)| t.board)
+                .unwrap_or_else(|| turns[greedy(&*net, &turns, mover)].board.clone())
         } else {
-            greedy(&*net, &turns, mover)
+            turns[greedy(&*net, &turns, mover)].board.clone()
         };
-        let next_board = turns[idx].board.clone();
 
         match outcome(&next_board) {
             Outcome::Win { mars, .. } => {
@@ -141,7 +162,7 @@ pub fn train(cfg: TrainConfig, verbose: bool) -> Net {
     let step = (cfg.games / 20).max(1);
     let mut total_len = 0usize;
     for g in 0..cfg.games {
-        total_len += self_play_episode(&mut net, &mut rng, cfg.lr, cfg.explore);
+        total_len += self_play_episode(&mut net, &mut rng, cfg.lr, cfg.explore, cfg.selfplay_plies);
         if verbose && (g + 1) % step == 0 {
             let avg = total_len as f32 / (g + 1) as f32;
             println!("  trained {:>7}/{} games (avg len {:.0})", g + 1, cfg.games, avg);
@@ -206,10 +227,11 @@ pub fn train_parallel(
                     .seed
                     .wrapping_mul(0x2545F491_4F6CDD1D)
                     .wrapping_add((round as u64).wrapping_mul(0x9E37_79B9) ^ (t as u64 + 1));
+                let plies = cfg.selfplay_plies;
                 std::thread::spawn(move || {
                     let mut rng = Rng::new(seed);
                     for _ in 0..sync {
-                        self_play_episode(&mut local, &mut rng, lr, explore);
+                        self_play_episode(&mut local, &mut rng, lr, explore, plies);
                     }
                     local
                 })
@@ -396,6 +418,7 @@ mod tests {
             lr: 0.1,
             explore: 0.0,
             seed: 1,
+            selfplay_plies: 1,
         };
         let net = train(cfg, false);
         let net_policy = SearchPolicy { eval: net, plies: 1 };

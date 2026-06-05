@@ -93,12 +93,55 @@
     before: PositionDto; // board state before this move (to review / replay)
     ranked: RankedTurnDto[] | null; // alternative moves with evaluations (human moves)
     isHuman: boolean; // whether this was the human's move (replayable)
+    cube?: boolean; // true → a cube action (double / take / pass / beaver), not a checker move
   };
   let history = $state<LogEntry[]>([]);
   let reviewIdx = $state<number | null>(null); // which log entry is expanded for review
   let logOpen = $state(true); // game-log panel expanded (plain div, not <details>, so
   // its scroll container flexes reliably — <details> wraps content in a box that
   // breaks flex-based internal scrolling)
+  // collapsible win-bar + best-moves overview (preference persisted across games)
+  function loadPref(key: string, def: boolean): boolean {
+    try {
+      const v = localStorage.getItem(key);
+      return v == null ? def : v === '1';
+    } catch {
+      return def;
+    }
+  }
+  function savePref(key: string, val: boolean) {
+    try {
+      localStorage.setItem(key, val ? '1' : '0');
+    } catch {
+      /* storage unavailable — preference just isn't remembered */
+    }
+  }
+  let barOpen = $state(loadPref('opornik.barOpen', true)); // win-probability bar shown
+  let analysisOpen = $state(loadPref('opornik.analysisOpen', true)); // best-moves panel shown
+  let autoRoll = $state(loadPref('opornik.autoRoll', false)); // roll the dice automatically
+  $effect(() => savePref('opornik.barOpen', barOpen));
+  $effect(() => savePref('opornik.analysisOpen', analysisOpen));
+  $effect(() => savePref('opornik.autoRoll', autoRoll));
+  // Auto-roll: when enabled, throw the dice automatically a beat after it becomes
+  // your roll (and auto-play the opening throw). The short delay lets you SEE the
+  // turn and still double first (the double button is up during the delay); the
+  // guards inside humanRoll/doOpeningRoll make a late timer harmless.
+  $effect(() => {
+    if (!autoRoll) return;
+    let act: (() => void) | null = null;
+    if (phase === 'humanRoll') {
+      act = () => {
+        if (autoRoll && phase === 'humanRoll') void humanRoll();
+      };
+    } else if (phase === 'openingRoll' && !openRoll) {
+      act = () => {
+        if (autoRoll && phase === 'openingRoll' && !openRoll) void doOpeningRoll();
+      };
+    }
+    if (!act) return;
+    const t = setTimeout(act, 700);
+    return () => clearTimeout(t);
+  });
   function snap(p: PositionDto): PositionDto {
     return JSON.parse(JSON.stringify(p));
   }
@@ -136,6 +179,7 @@
       !pos.crawford &&
       (pos.cube.owner === null || pos.cube.owner === humanColor),
   );
+  const doubleTo = $derived(pos ? pos.cube.value * 2 : 0); // value after a pending double
   const matchOver = $derived(
     matchLength != null && (matchScore[0] >= matchLength || matchScore[1] >= matchLength),
   );
@@ -432,6 +476,27 @@
     return p.cube.owner === humanColor ? 'у вас' : 'у движка';
   }
 
+  // Record a cube action (double offer / take / pass / beaver) in the game sheet
+  // so the лист партии reflects the full doubling history, not just checker moves.
+  function logCube(color: PlayerColor, text: string) {
+    if (!pos) return;
+    history = [
+      ...history,
+      {
+        n: pos.turn_number,
+        color,
+        dice: null,
+        notation: text,
+        win: null,
+        loss: null,
+        before: snap(pos),
+        ranked: null,
+        isHuman: false,
+        cube: true,
+      },
+    ];
+  }
+
   function finishGame(winner: PlayerColor, points: number, reason: string) {
     if (winner === humanColor) matchScore[0] += points;
     else matchScore[1] += points;
@@ -473,8 +538,22 @@
     clearMoveBuild();
     finishGame(aiColor, points, mars ? 'Сдача с марсом' : 'Сдача (оин)');
   }
+  // Resign has exactly ONE correct outcome per position (no оин/марс choice to
+  // make): оин once a checker is borne off, else марс — ×cube. The button just
+  // asks for confirmation.
+  let confirmResign = $state(false);
+  const resignPoints = $derived(pos ? (canResignSingle ? 1 : 2) * pos.cube.value : 0);
+  function askResign() {
+    if (!pos || animating || (phase !== 'humanRoll' && phase !== 'humanMove')) return;
+    confirmResign = true;
+  }
+  function doResign() {
+    confirmResign = false;
+    resign(!canResignSingle); // оин when mars is impossible, else марс
+  }
 
   async function continueAfter() {
+    confirmResign = false;
     await updateWin();
     if (!pos) return;
     if (isOver(pos)) {
@@ -582,6 +661,7 @@
 
   // ---- save / export the current game so it can be resumed later ----
   let saveMsg = $state('');
+  let sheetMsg = $state(''); // confirmation for the game-sheet (лист партии) export
   let exportStr = $state('');
   function defaultName(): string {
     const sc =
@@ -635,6 +715,75 @@
       flash('Строка скопирована ✓');
     } catch {
       flash('Скопируйте строку ниже');
+    }
+  }
+
+  // ---- save the full game sheet (лист партии) as a readable transcript ----
+  function transcriptText(): string {
+    const L: string[] = [];
+    const me = humanColor === 'white' ? '⚪ белые' : '⚫ чёрные';
+    const opp = aiColor === 'white' ? '⚪ белые' : '⚫ чёрные';
+    L.push(`Длинные нарды — ${variantName[variant]}`);
+    L.push(
+      matchLength != null
+        ? `Матч до ${matchLength} · счёт ${matchScore[0]}:${matchScore[1]}`
+        : `Счёт ${matchScore[0]}:${matchScore[1]}`,
+    );
+    L.push(`Вы: ${me} · движок: ${opp} (поиск ${aiPly}-ply)`);
+    L.push(`Сохранено: ${new Date().toLocaleString('ru-RU')}`);
+    L.push('');
+    L.push([pad('№', 4), pad('игрок', 8), pad('кости', 6), pad('ход', 22), 'оценка'].join(' '));
+    L.push('─'.repeat(52));
+    for (const h of history) {
+      const who = h.color === humanColor ? 'вы' : 'движок';
+      if (h.cube) {
+        L.push(`${pad(String(h.n), 4)} ${pad(who, 8)} 🎲² ${h.notation}`);
+        continue;
+      }
+      const dice = h.dice ? `${h.dice[0]}-${h.dice[1]}` : '';
+      L.push(
+        [pad(String(h.n), 4), pad(who, 8), pad(dice, 6), pad(h.notation, 22), evalLabel(h)].join(' '),
+      );
+    }
+    L.push('─'.repeat(52));
+    if (pos) L.push(`Пипсы: ⚪ ${pos.pip[0]} · ⚫ ${pos.pip[1]} · ход №${pos.turn_number}`);
+    if (phase === 'over') L.push(status);
+    L.push('');
+    L.push('opornik · https://rmv0x11.github.io/opornik/');
+    return L.join('\n');
+  }
+  function pad(s: string, n: number): string {
+    return s.length >= n ? s : s + ' '.repeat(n - s.length);
+  }
+  function flashSheet(msg: string) {
+    sheetMsg = msg;
+    setTimeout(() => (sheetMsg = ''), 2800);
+  }
+  async function saveTranscript() {
+    if (!history.length) return;
+    const text = transcriptText();
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const fname = `opornik-${variant}-${stamp}.txt`;
+    let downloaded = false;
+    try {
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      downloaded = true;
+    } catch {
+      /* download unsupported — fall back to clipboard only */
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      flashSheet(downloaded ? 'Лист партии скачан и скопирован ✓' : 'Лист партии скопирован ✓');
+    } catch {
+      flashSheet(downloaded ? 'Лист партии скачан ✓' : 'Скопируйте лист вручную');
     }
   }
 
@@ -719,6 +868,7 @@
 
   async function humanRoll() {
     if (phase !== 'humanRoll') return;
+    confirmResign = false;
     phase = 'rolling';
     clearAnalysis();
     try {
@@ -741,9 +891,13 @@
       if (cd.opponent_should_take) {
         pos = await engine.offerDouble();
         await updateWin();
+        logCube(humanColor, `удвоение ×${pre} → ×${pos.cube.value}`);
+        logCube(aiColor, 'тайк (взял)');
         status = `Соперник взял (тайк). Куб ×${pos.cube.value}. Ваш ход — бросайте.`;
         phase = 'humanRoll';
       } else {
+        logCube(humanColor, `удвоение ×${pre} → ×${pre * 2}`);
+        logCube(aiColor, 'пас (сброс)');
         finishGame(humanColor, pre, 'Соперник пасанул');
       }
     } catch (e) {
@@ -820,6 +974,7 @@
           pendingPre = pos.cube.value;
           pos = await engine.offerDouble();
           await updateWin();
+          logCube(aiColor, `удвоение ×${pendingPre} → ×${pos.cube.value}`);
           status = `Движок удваивает до ${pos.cube.value}. Ваш ответ?`;
           phase = 'cubeResponse';
           return;
@@ -890,6 +1045,7 @@
 
   async function cubeTake() {
     if (phase !== 'cubeResponse') return;
+    logCube(humanColor, 'тайк (взял)');
     phase = 'ai';
     status = 'Вы взяли (тайк). Ход движка…';
     try {
@@ -900,6 +1056,7 @@
   }
   function cubeDrop() {
     if (phase !== 'cubeResponse') return;
+    logCube(humanColor, 'пас (сброс)');
     finishGame(aiColor, pendingPre, 'Вы пасанули');
   }
   async function cubeBeaver() {
@@ -908,6 +1065,7 @@
     try {
       pos = await engine.beaver();
       await updateWin();
+      logCube(humanColor, `бивер → ×${pos.cube.value}`);
       status = `Бивер! Куб ×${pos.cube.value}. Ход движка…`;
       await aiRoll();
     } catch (e) {
@@ -978,10 +1136,43 @@
   </header>
 
   {#if pos}
-    <div class="winbar" title="Ваши шансы">
-      <div class="fill" style="transform: scaleX({displayWin})"></div>
-      <span class="label">вы {(displayWin * 100).toFixed(0)}%</span>
+    <div class="winbar" class:collapsed={!barOpen}>
+      {#if barOpen}
+        <div class="track" title="Ваши шансы">
+          <div class="fill" style="transform: scaleX({displayWin})"></div>
+          <span class="label">вы {(displayWin * 100).toFixed(0)}%</span>
+        </div>
+      {:else}
+        <span class="label muted">шкала шансов скрыта · вы {(displayWin * 100).toFixed(0)}%</span>
+      {/if}
+      <button
+        type="button"
+        class="bar-toggle"
+        aria-label={barOpen ? 'Скрыть шкалу шансов' : 'Показать шкалу шансов'}
+        onclick={() => (barOpen = !barOpen)}>{barOpen ? '▾' : '▸'}</button
+      >
     </div>
+
+    {#snippet boardCenter()}
+      {#if phase === 'openingRoll' && !openRoll}
+        <button class="act primary" onclick={doOpeningRoll}>🎲 Разыграть первый ход</button>
+      {:else if phase === 'humanRoll'}
+        {#if canHumanDouble}
+          <button class="act ghost-act" onclick={humanDouble}>⬆ Удвоить (→{doubleTo})</button>
+        {/if}
+      {:else if phase === 'cubeResponse'}
+        <div class="act-puck">
+          <span class="cube-offer">🎲² движок удвоил → ×{pos?.cube.value}</span>
+          <div class="act-row">
+            <button class="act primary" onclick={cubeTake}>Тайк (взять)</button>
+            <button class="act ghost-act" onclick={cubeDrop}>Пас (сбросить)</button>
+            {#if canBeaver}<button class="act ghost-act" onclick={cubeBeaver}>Бивер</button>{/if}
+          </div>
+        </div>
+      {:else if phase === 'humanMove' && completeSeq}
+        <button class="act primary" onclick={confirmMove}>✓ Подтвердить ход</button>
+      {/if}
+    {/snippet}
 
     <Board
       position={displayPos ?? aiAnim ?? pos}
@@ -995,6 +1186,7 @@
       canRoll={phase === 'humanRoll'}
       {bearOffCell}
       {boardStyle}
+      center={boardCenter}
       onPointClick={handlePointClick}
       {onDrop}
       onRoll={humanRoll}
@@ -1002,6 +1194,20 @@
     />
 
     <div class="panel">
+      <div class="pips" title="Пипсы — сумма очков до вывода всех шашек (меньше = ближе к победе)">
+        <span class="pip-cap">пипсы</span>
+        <span class="pip-val"><span class="pip-dot white"></span>{pos.pip[0]}</span>
+        <span class="pip-val"><span class="pip-dot black"></span>{pos.pip[1]}</span>
+        <span class="pip-turn">ход №{pos.turn_number}</span>
+        <button
+          type="button"
+          class="auto-toggle"
+          class:on={autoRoll}
+          aria-pressed={autoRoll}
+          onclick={() => (autoRoll = !autoRoll)}
+          title="Бросать кости автоматически"
+        >⚡ авто-бросок{autoRoll ? ' ✓' : ''}</button>
+      </div>
       {#if hasCube}
         <div class="cube-state">🎲² Куб: <strong>{pos.cube.value}</strong> ({cubeOwnerDesc(pos)})</div>
       {/if}
@@ -1009,7 +1215,30 @@
         <div class="crawford">⚑ Кроуфорд — удвоение запрещено</div>
       {/if}
 
-      <p class="status">{status}</p>
+      <div class="status-row">
+        <p class="status">{status}</p>
+        {#if (phase === 'humanRoll' || phase === 'humanMove') && !confirmResign}
+          <button type="button" class="resign-btn" onclick={askResign} disabled={animating}>
+            🏳 Сдаться
+          </button>
+        {/if}
+      </div>
+      {#if (phase === 'humanRoll' || phase === 'humanMove') && confirmResign}
+        <div class="resign-confirm">
+          <p class="rc-q">
+            Сдать партию? Соперник получит <strong>+{resignPoints}</strong>
+            ({canResignSingle ? 'оин' : 'марс'}).
+          </p>
+          <div class="moves">
+            <button type="button" class="ghost danger" onclick={doResign} disabled={animating}>
+              Да, сдаться
+            </button>
+            <button type="button" class="ghost" onclick={() => (confirmResign = false)}>
+              Отмена
+            </button>
+          </div>
+        </div>
+      {/if}
 
       {#if aiLast}
         <div class="ailast">
@@ -1030,8 +1259,7 @@
       {#if phase === 'openingRoll'}
         <div class="opening">
           {#if !openRoll}
-            <p class="opening-hint">Кто выбросит больше — ходит первым.</p>
-            <button class="primary" onclick={doOpeningRoll}>🎲 Разыграть первый ход</button>
+            <p class="opening-hint">Кто выбросит больше — ходит первым. Кнопка — в центре доски.</p>
           {:else}
             <div class="open-dice">
               <span class="od">
@@ -1056,28 +1284,10 @@
             </div>
           {/if}
         </div>
-      {:else if phase === 'humanRoll'}
-        <div class="moves">
-          <button class="primary" onclick={humanRoll}>🎲 Бросить кости</button>
-          {#if canHumanDouble}
-            <button class="ghost" onclick={humanDouble}>⬆ Удвоить (→{pos.cube.value * 2})</button>
-          {/if}
-        </div>
       {:else if phase === 'rolling'}
         <p class="thinking">бросаем…</p>
-      {:else if phase === 'cubeResponse'}
-        <div class="moves">
-          <button class="primary" onclick={cubeTake}>Тайк (взять)</button>
-          <button class="ghost" onclick={cubeDrop}>Пас (сбросить)</button>
-          {#if canBeaver}
-            <button class="ghost" onclick={cubeBeaver}>Бивер</button>
-          {/if}
-        </div>
       {:else if phase === 'humanMove'}
         <div class="moves">
-          {#if completeSeq}
-            <button class="primary" onclick={confirmMove}>✓ Подтвердить ход</button>
-          {/if}
           {#if bearOffChain}
             <button class="primary" onclick={bearOffSelected}>Выкинуть шашку ↑</button>
             <span class="hint">или свайпните фишку вверх</span>
@@ -1096,7 +1306,17 @@
         </details>
 
         {#if ranked}
-          <div class="analysis">
+          <div class="analysis" class:collapsed={!analysisOpen}>
+            <button
+              type="button"
+              class="an-head"
+              aria-expanded={analysisOpen}
+              onclick={() => (analysisOpen = !analysisOpen)}
+            >
+              Лучшие ходы
+              <span class="an-caret">{analysisOpen ? '▾' : '▸'}</span>
+            </button>
+            {#if analysisOpen}
             {#if cubeDec}
               <div class="cube {cubeDec.action}">
                 Куб: <strong>{cubeDec.note}</strong>
@@ -1126,6 +1346,7 @@
               {/each}
             </ol>
             <p class="ranknote">Сортировка по эквити (учитывает марс), а не по чистому win%.</p>
+            {/if}
           </div>
         {/if}
       {:else if phase === 'ai'}
@@ -1160,36 +1381,28 @@
         {/if}
       {/if}
 
-      {#if phase === 'humanRoll' || phase === 'humanMove'}
-        <details class="resign">
-          <summary>🏳 Сдаться</summary>
-          <div class="moves">
-            {#if canResignSingle}
-              <button class="ghost" onclick={() => resign(false)} disabled={animating}>
-                Сдаться — оин (−{pos.cube.value})
-              </button>
-            {/if}
-            <button class="ghost danger" onclick={() => resign(true)} disabled={animating}>
-              Сдаться с марсом (−{2 * pos.cube.value})
-            </button>
-          </div>
-          {#if !canResignSingle}
-            <p class="hint">оин недоступен — марс ещё возможен (нет снятых шашек)</p>
-          {/if}
-        </details>
-      {/if}
-
       {#if history.length}
         <div class="gamelog" class:open={logOpen}>
-          <button
-            type="button"
-            class="gl-summary"
-            aria-expanded={logOpen}
-            onclick={() => (logOpen = !logOpen)}
-          >
-            Лист партии ({history.length})
-            <span class="gl-caret">{logOpen ? '▾' : '▸'}</span>
-          </button>
+          <div class="gl-head">
+            <button
+              type="button"
+              class="gl-summary"
+              aria-expanded={logOpen}
+              onclick={() => (logOpen = !logOpen)}
+            >
+              Лист партии ({history.length})
+              <span class="gl-caret">{logOpen ? '▾' : '▸'}</span>
+            </button>
+            <button
+              type="button"
+              class="gl-save"
+              onclick={saveTranscript}
+              title="Скачать .txt и скопировать в буфер"
+            >
+              📄 Скачать лист
+            </button>
+            {#if sheetMsg}<span class="gl-msg">{sheetMsg}</span>{/if}
+          </div>
           {#if logOpen}
           <ol class="log">
             {#each history as h, i}
@@ -1199,19 +1412,22 @@
                   class="logrow {sev(h.loss)}"
                   class:me={h.color === humanColor}
                   class:active={reviewIdx === i}
+                  class:cube={h.cube}
                   onclick={() => toggleReview(i)}
-                  title="Показать другие варианты"
+                  title={h.cube ? 'Действие с кубом' : 'Показать другие варианты'}
                 >
                   <span class="ln">{h.n}</span>
                   <span class="who">{h.color === humanColor ? 'вы' : 'движок'}</span>
                   <span class="dc">{h.dice ? `${h.dice[0]}-${h.dice[1]}` : ''}</span>
-                  <span class="mv">{h.notation}</span>
+                  <span class="mv">{h.cube ? `🎲² ${h.notation}` : h.notation}</span>
                   <span class="ev">{evalLabel(h)}</span>
                   <span class="caret">{reviewIdx === i ? '▾' : '▸'}</span>
                 </button>
                 {#if reviewIdx === i}
                   <div class="review">
-                    {#if h.ranked && h.ranked.length}
+                    {#if h.cube}
+                      <div class="review-head">Действие с кубом — запись для листа партии.</div>
+                    {:else if h.ranked && h.ranked.length}
                       <div class="review-head">Другие варианты:</div>
                       <ol class="alts">
                         {#each h.ranked as r, ri}
@@ -1249,8 +1465,6 @@
           {/if}
         </div>
       {/if}
-
-      <div class="meta">пипсы: ⚪ {pos.pip[0]} · ⚫ {pos.pip[1]} · ход №{pos.turn_number}</div>
     </div>
   {:else}
     <p class="status">{status}</p>
@@ -1309,13 +1523,19 @@
     cursor: default;
   }
   .winbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 0.6rem;
+  }
+  .winbar .track {
     position: relative;
+    flex: 1;
     height: 26px;
     background: linear-gradient(180deg, #3a3a3e, #161618);
     border: 1px solid #5a371d;
     border-radius: 13px;
     overflow: hidden;
-    margin-bottom: 0.6rem;
     box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
   }
   .winbar .fill {
@@ -1329,7 +1549,7 @@
   .winbar .label {
     font-variant-numeric: var(--num-tabular);
   }
-  .winbar .label {
+  .winbar .track .label {
     position: absolute;
     inset: 0;
     display: flex;
@@ -1340,8 +1560,122 @@
     mix-blend-mode: difference;
     filter: invert(1);
   }
+  .winbar .label.muted {
+    flex: 1;
+    color: var(--ink-faint);
+    font: 600 0.8rem var(--font-ui);
+  }
+  .bar-toggle {
+    flex: 0 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-sm);
+    color: var(--ink-wood);
+    cursor: pointer;
+    padding: 2px 9px;
+    font-size: 12px;
+    line-height: 1.7;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .bar-toggle:hover {
+    background: var(--surface-raised);
+  }
+  /* best-moves overview: collapsible header */
+  .an-head {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    gap: 0.4rem;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 0 0.3rem;
+    font: var(--fw-semi) 0.92rem var(--font-ui);
+    color: #6b4423;
+    text-align: left;
+  }
+  .an-head:hover {
+    color: #8a5a2f;
+  }
+  .an-caret {
+    margin-left: auto;
+    color: #bba784;
+  }
+  .analysis.collapsed {
+    padding-bottom: 0.5rem;
+  }
   .panel {
     margin-top: 1rem;
+  }
+  /* pip counts right under the board (was buried at the very bottom before) */
+  .pips {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.7rem;
+    margin: 0.1rem 0 0.55rem;
+    padding: 0.32rem 0.6rem;
+    background: var(--surface-sunken);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-sm);
+    font: var(--fw-semi) 0.92rem var(--font-mono);
+    font-variant-numeric: var(--num-tabular);
+    color: var(--ink);
+  }
+  .pip-cap {
+    color: var(--ink-faint);
+    font-weight: var(--fw-medium);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.72rem;
+  }
+  .pip-val {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.32rem;
+  }
+  .pip-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .pip-dot.white {
+    background: var(--checker-grad-white);
+    border: 1px solid var(--chip-white-edge, #9a8f78);
+  }
+  .pip-dot.black {
+    background: var(--checker-grad-black);
+    border: 1px solid var(--chip-black-edge, #000);
+  }
+  .pip-turn {
+    margin-left: auto;
+    color: var(--ink-faint);
+    font-size: 0.8rem;
+    font-weight: var(--fw-medium);
+  }
+  .auto-toggle {
+    flex: 0 0 auto;
+    cursor: pointer;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-pill);
+    background: var(--surface);
+    color: var(--ink-muted);
+    font: var(--fw-semi) 0.72rem var(--font-ui);
+    white-space: nowrap;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .auto-toggle:hover {
+    background: var(--surface-raised);
+  }
+  .auto-toggle.on {
+    background: linear-gradient(180deg, #ffe9a8, #f3cf6f);
+    border-color: #d9a93f;
+    color: #5a3d12;
   }
   .cube-state {
     margin-bottom: 0.4rem;
@@ -1351,6 +1685,16 @@
     margin-bottom: 0.4rem;
     color: #b22;
     font-weight: 600;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.8rem;
+  }
+  .status-row .status {
+    flex: 1;
+    min-width: 0;
   }
   .status {
     font-weight: 600;
@@ -1486,17 +1830,58 @@
     resize: vertical;
     color: #4a3320;
   }
-  .resign {
-    margin-top: 0.6rem;
-    font-size: 0.85rem;
-  }
-  .resign > summary {
+  .resign-btn {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.32rem;
     cursor: pointer;
-    color: #a06a4a;
-    width: max-content;
+    color: var(--ink-muted);
+    background: linear-gradient(180deg, var(--surface), var(--surface-raised));
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-pill);
+    padding: 0.34rem 0.85rem;
+    font: var(--fw-semi) 0.82rem var(--font-ui);
+    box-shadow: var(--shadow-1);
+    white-space: nowrap;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out);
   }
-  .resign .moves {
-    margin-top: 0.4rem;
+  .resign-btn:hover {
+    background: linear-gradient(180deg, var(--danger-soft), #f3dcd6);
+    color: var(--danger);
+    border-color: #d8a8a0;
+    box-shadow: var(--shadow-2);
+    transform: translateY(-1px);
+  }
+  .resign-btn:active {
+    transform: scale(0.97);
+  }
+  .resign-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+    transform: none;
+    box-shadow: none;
+  }
+  .resign-confirm {
+    margin-top: 0.2rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--danger-soft);
+    border: 1px solid #e0b8b0;
+    border-radius: var(--radius-md);
+    animation: reveal var(--dur-base) var(--ease-decelerate);
+  }
+  .rc-q {
+    margin: 0 0 0.55rem;
+    color: #7a4a3a;
+    font-size: 0.92rem;
+  }
+  .resign-confirm .moves {
+    margin-top: 0;
   }
   .ghost.danger {
     border-color: #c79a9a;
@@ -1541,6 +1926,83 @@
   }
   button.primary:active {
     transform: scale(0.97);
+  }
+  /* ---- on-board action buttons (centred over the felt) ---- */
+  .act {
+    font-family: var(--font-ui);
+    font-weight: var(--fw-semi);
+    font-size: 0.95rem;
+    padding: 0.5rem 1.05rem;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    white-space: nowrap;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow: var(--shadow-3), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+    transition:
+      transform var(--dur-instant) var(--ease-out),
+      filter var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
+    animation: act-in var(--dur-base) var(--ease-settle) backwards;
+  }
+  .act.primary {
+    background: linear-gradient(180deg, var(--btn-primary-hi), var(--btn-primary));
+    color: #fff;
+  }
+  .act.ghost-act {
+    background: rgba(18, 28, 22, 0.82);
+    color: var(--felt-label);
+    -webkit-backdrop-filter: blur(2px);
+    backdrop-filter: blur(2px);
+  }
+  .act:hover {
+    filter: brightness(1.07);
+    transform: translateY(-1px);
+  }
+  .act:active {
+    transform: scale(0.96);
+  }
+  .act-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    justify-content: center;
+  }
+  .act-puck {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.7rem;
+    background: rgba(16, 26, 20, 0.74);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-3);
+    -webkit-backdrop-filter: blur(3px);
+    backdrop-filter: blur(3px);
+    animation: act-in var(--dur-base) var(--ease-settle) backwards;
+  }
+  .cube-offer {
+    color: #ffe7a8;
+    font: var(--fw-semi) 0.86rem var(--font-ui);
+    letter-spacing: 0.01em;
+    text-align: center;
+  }
+  @keyframes act-in {
+    from {
+      opacity: 0;
+      transform: translateY(9px) scale(0.9);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .act,
+    .act-puck {
+      animation: none;
+    }
   }
   .thinking {
     color: #888;
@@ -1631,9 +2093,15 @@
     border-radius: 8px;
     background: #fcf8f1;
   }
+  .gl-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding-right: 0.4rem;
+  }
   .gl-summary {
-    display: block;
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     text-align: left;
     cursor: pointer;
     padding: 0.5rem 0.7rem;
@@ -1645,6 +2113,32 @@
   }
   .gl-summary:hover {
     background: #f6efe2;
+  }
+  .gl-save {
+    flex: 0 0 auto;
+    cursor: pointer;
+    padding: 0.42rem 0.7rem;
+    font: 600 0.84rem var(--font-ui);
+    color: var(--ink-wood);
+    background: var(--surface);
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      transform var(--dur-instant) var(--ease-out);
+  }
+  .gl-save:hover {
+    background: var(--surface-raised);
+  }
+  .gl-save:active {
+    transform: scale(0.97);
+  }
+  .gl-msg {
+    flex: 0 0 auto;
+    color: #2a6;
+    font-size: 0.82rem;
+    font-weight: 600;
   }
   .gl-caret {
     float: right;
@@ -1713,6 +2207,13 @@
   .logrow.blunder .ev {
     color: #c22;
     font-weight: 700;
+  }
+  .logrow.cube .mv {
+    color: #8a5a16;
+    font-weight: 600;
+  }
+  .logrow.cube .who {
+    color: #8a5a16;
   }
   .review {
     padding: 0.5rem 0.4rem 0.6rem 1.6rem;
@@ -1872,7 +2373,7 @@
     .moves button,
     .ghost,
     .movelist summary,
-    .resign > summary {
+    .resign-btn {
       padding: 0.55rem 0.85rem;
       min-height: 42px;
       display: inline-flex;
@@ -1885,6 +2386,17 @@
     .logrow,
     .alt {
       min-height: 36px;
+    }
+    /* roomy, tappable on-board action buttons on phones */
+    .act {
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.92rem;
+      padding: 0.55rem 1rem;
+    }
+    .gl-save {
+      min-height: 40px;
     }
   }
 </style>

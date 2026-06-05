@@ -5,6 +5,7 @@
 //! engine-train bench  --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]
 //! ```
 
+use std::io::BufRead;
 use std::process::ExitCode;
 
 use engine_core::bearoff::BearoffTable;
@@ -14,6 +15,7 @@ use engine_core::moves::{generate_turns_cfg, Turn};
 use engine_core::net::Net;
 use engine_core::player::Player;
 use engine_core::search::{position_equity, Composite, Heuristic};
+use engine_train::logasai::{self, Decision};
 use engine_train::{
     benchmark, default_threads, rollout_equity, train_parallel, BenchResult, Policy, RandomPolicy,
     Rng, SearchPolicy, TrainConfig,
@@ -47,6 +49,7 @@ fn cmd_train(args: &[String]) -> ExitCode {
         lr: arg(args, "--lr", 0.05),
         explore: arg(args, "--explore", 0.05),
         seed: arg(args, "--seed", 0xC0FFEE),
+        selfplay_plies: arg(args, "--selfplay-plies", 1u8),
     };
     let out = str_arg(args, "--out", "net.bin");
     let threads = arg(args, "--threads", default_threads());
@@ -408,6 +411,171 @@ fn cmd_er(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Parse a one-line position spec used by `relay`/`agree`:
+///   `white=24:13,18:2 black=24:15 turn=W dice=3,1 [white-off=N] [black-off=N] [first]`
+fn parse_pos_line(spec: &str) -> Option<(Board, Player, [u8; 2], bool)> {
+    let mut board = Board::empty();
+    let mut turn = Player::White;
+    let mut dice: Option<[u8; 2]> = None;
+    let mut first = false;
+    for tok in spec.split_whitespace() {
+        let (k, v) = tok.split_once('=').unwrap_or((tok, ""));
+        match k {
+            "white" => parse_side(v, Player::White, &mut board),
+            "black" => parse_side(v, Player::Black, &mut board),
+            "white-off" => board.off[Player::White.index()] = v.parse().unwrap_or(0),
+            "black-off" => board.off[Player::Black.index()] = v.parse().unwrap_or(0),
+            "turn" => turn = parse_player(v),
+            "dice" => {
+                let d: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if d.len() == 2 {
+                    dice = Some([d[0], d[1]]);
+                }
+            }
+            "first" => first = v.is_empty() || v.eq_ignore_ascii_case("true") || v == "1",
+            _ => {}
+        }
+    }
+    Some((board, turn, dice?, first))
+}
+
+/// Relay: read position+roll lines from stdin and print the engine's best plays.
+/// Pair with LogasAI — type its position and roll, mirror our move, record the
+/// result. One position per line; blank lines and `#` comments are skipped.
+fn cmd_relay(args: &[String]) -> ExitCode {
+    let net = match load_net(&str_arg(args, "--net", "")) {
+        Some(n) => n,
+        None => {
+            eprintln!("relay: need a valid --net PATH");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plies = arg(args, "--ply", 2u8).max(1);
+    let top = arg(args, "--top", 4usize);
+    eprintln!("relay ready ({plies}-ply). line: white=24:13,.. black=24:15 turn=W dice=3,1 [first]");
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let line = line.trim().to_string();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((board, mover, dice, first)) = parse_pos_line(&line) else {
+            eprintln!("  ? unparseable line (need at least dice=d1,d2)");
+            continue;
+        };
+        if !board.is_valid() {
+            eprintln!(
+                "  ! not a 15+15 position (W {}, B {})",
+                board.checkers_on_board(Player::White) + board.off[Player::White.index()],
+                board.checkers_on_board(Player::Black) + board.off[Player::Black.index()],
+            );
+        }
+        let ranked = logasai::rank(&net, &board, mover, dice, first, plies);
+        if ranked.is_empty() || (ranked.len() == 1 && ranked[0].notation == "pass") {
+            println!("{mover:?} {}-{}: forced pass", dice[0], dice[1]);
+            continue;
+        }
+        println!(
+            "{mover:?} to play {}-{} ({} plays, {plies}-ply):",
+            dice[0],
+            dice[1],
+            ranked.len()
+        );
+        for (i, r) in ranked.iter().take(top).enumerate() {
+            let mark = if i == 0 { "*" } else { " " };
+            println!(
+                "  {mark}{}. {:<26} eq {:+.3}  win {:.1}%",
+                i + 1,
+                r.notation,
+                r.equity,
+                r.win * 100.0
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Agreement / ER benchmark against logged games — the standard backgammon
+/// strength metric vs a reference engine. Decisions come from a text file
+/// (`--file`, one `… play=<move>` line each) and/or a `.MAT` transcript (`--mat`).
+fn cmd_agree(args: &[String]) -> ExitCode {
+    let net = match load_net(&str_arg(args, "--net", "")) {
+        Some(n) => n,
+        None => {
+            eprintln!("agree: need a valid --net PATH");
+            return ExitCode::FAILURE;
+        }
+    };
+    let plies = arg(args, "--ply", 2u8).max(1);
+    let mut decisions: Vec<Decision> = Vec::new();
+
+    let file = str_arg(args, "--file", "");
+    if !file.is_empty() {
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let Some((prefix, played)) = line.split_once(" play=") else {
+                        eprintln!("  ? line without `play=`: {line}");
+                        continue;
+                    };
+                    if let Some((board, mover, dice, first)) = parse_pos_line(prefix) {
+                        decisions.push(Decision {
+                            board,
+                            mover,
+                            dice,
+                            first,
+                            played: played.trim().to_string(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("agree: cannot read {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mat = str_arg(args, "--mat", "");
+    if !mat.is_empty() {
+        match std::fs::read_to_string(&mat) {
+            Ok(text) => {
+                let plies_in = logasai::parse_mat(&text);
+                let (recon, fail) = logasai::replay_plies(&plies_in);
+                println!(
+                    "MAT {mat}: {} plies parsed, {} reconstructed{}",
+                    plies_in.len(),
+                    recon.len(),
+                    fail.map(|k| format!(" (stopped at ply {k} — notation mismatch)"))
+                        .unwrap_or_default(),
+                );
+                decisions.extend(recon);
+            }
+            Err(e) => {
+                eprintln!("agree: cannot read {mat}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if decisions.is_empty() {
+        eprintln!("agree: no decisions (provide --file and/or --mat)");
+        return ExitCode::FAILURE;
+    }
+
+    let r = logasai::agree(&net, &decisions, plies);
+    println!(
+        "\nAgreement vs our {plies}-ply best ({} decisions, {} matched, {} unmatched):",
+        r.decisions, r.matched, r.unmatched
+    );
+    println!("  move agreement {:.1}%", r.agreement_rate() * 100.0);
+    println!("  error rate     {:.4} equity/decision", r.error_rate());
+    ExitCode::SUCCESS
+}
+
 fn report(label: &str, r: &BenchResult) {
     println!(
         "{label}: {} games — win rate {:.1}% ({}/{}) | {:+.3} ppg",
@@ -428,9 +596,11 @@ fn main() -> ExitCode {
         Some("analyze") => cmd_analyze(&args[1..]),
         Some("endbench") => cmd_endbench(&args[1..]),
         Some("er") => cmd_er(&args[1..]),
+        Some("relay") => cmd_relay(&args[1..]),
+        Some("agree") => cmd_agree(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]"
+                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S]\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
             );
             ExitCode::FAILURE
         }

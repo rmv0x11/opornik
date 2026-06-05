@@ -143,6 +143,11 @@
     --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
     --num-tabular: tabular-nums lining-nums;
+    /* font weights (used in font: shorthands across Board/Play — must be defined
+       or the whole shorthand is invalid and silently falls back) */
+    --fw-medium: 500;
+    --fw-semi: 600;
+    --fw-bold: 700;
     --radius-sm: 6px;
     --radius-md: 10px;
     --radius-lg: 14px;

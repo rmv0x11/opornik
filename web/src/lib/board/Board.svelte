@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, type Snippet } from 'svelte';
   import type { PositionDto } from '../../engine/types';
   import { buildSlotToCell, phys, posOfPhys, type PlayerColor } from './coords';
 
@@ -15,6 +15,7 @@
     canRoll = false,
     bearOffCell = null,
     boardStyle = '',
+    center,
     onPointClick,
     onDrop,
     onRoll,
@@ -31,6 +32,7 @@
     canRoll?: boolean; // show a clickable roll prompt in the centre
     bearOffCell?: number | null; // the selected checker's cell, if it can bear off
     boardStyle?: string; // theme CSS-variable overrides applied to the board
+    center?: Snippet; // action buttons rendered centred ON the board (confirm/double/cube)
     onPointClick?: (cell: number) => void;
     onDrop?: (cell: number) => void; // drag release over a destination
     onRoll?: () => void; // tap the centre of the board to roll
@@ -272,19 +274,28 @@
       </button>
     {/each}
   </div>
-  </div>
 
-  <div class="rail">
-    <div class="dice-slot">
+    <!-- Action buttons centred ON the board: the roll cup (when it is your roll),
+         plus whatever the host passes in `center` (confirm / double / cube reply).
+         The container is click-through (pointer-events:none); only the buttons
+         capture taps, so building a move on the board is never blocked. -->
+    <div class="board-actions">
       {#if canRoll}
-        <button type="button" class="rollzone" onclick={() => onRoll?.()} aria-label="Бросок костей">
+        <button type="button" class="rollzone" onclick={() => onRoll?.()} aria-label="Бросить кости">
           <span class="cup-row">
             <span class="cup die-face">🎲</span>
             <span class="cup die-face">🎲</span>
           </span>
-          <span class="rolltext">бросок</span>
+          <span class="rolltext">Бросить кости</span>
         </button>
-      {:else if position.dice}
+      {/if}
+      {@render center?.()}
+    </div>
+  </div>
+
+  <div class="rail">
+    <div class="dice-slot">
+      {#if position.dice}
         {#key position.dice}
           {#each position.dice as d}
             <span class="die {position.turn} rolling" aria-label={`кость ${d}`}>
@@ -348,6 +359,25 @@
     gap: 0;
     flex: 1 1 auto;
     min-width: 0;
+    position: relative; /* positioning context for the centred action overlay */
+  }
+  /* centred, click-through overlay holding the on-board action buttons */
+  .board-actions {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    pointer-events: none; /* taps fall through to the points… */
+    width: max-content;
+    max-width: 92%;
+  }
+  .board-actions > :global(*) {
+    pointer-events: auto; /* …except the buttons themselves */
   }
   .row {
     display: flex;
@@ -613,46 +643,101 @@
     background: var(--checker-grad-black);
     border: 1px solid var(--chip-black-edge, #000);
   }
+  /* the roll cup now lives in the centre of the board (not the side rail): a
+     prominent, inviting target shown only when it is the player's turn to roll */
   .rollzone {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 3px;
-    width: 100%;
+    gap: 4px;
     box-sizing: border-box;
-    padding: 6px 3px;
+    padding: 0.55rem 1.1rem 0.5rem;
     border: 1px solid var(--wood-hi);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     background: linear-gradient(180deg, var(--wood), var(--wood-mid));
     color: var(--felt-label);
-    font: var(--fw-bold) 11px var(--font-ui);
+    font: var(--fw-bold) 0.92rem var(--font-ui);
     cursor: pointer;
-    box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    box-shadow: var(--shadow-3), inset 0 1px 0 rgba(255, 255, 255, 0.2);
     transition:
       background var(--dur-fast) var(--ease-out),
       transform var(--dur-instant) var(--ease-out),
       box-shadow var(--dur-fast) var(--ease-out);
-    animation: reveal var(--dur-base) var(--ease-decelerate);
+    animation:
+      act-pop var(--dur-base) var(--ease-settle) backwards,
+      roll-breathe 2.6s ease-in-out 0.6s infinite;
   }
   .rollzone:hover {
     background: linear-gradient(180deg, var(--wood-hi), var(--wood));
-    transform: translateY(-1px);
-    box-shadow: var(--shadow-2), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    transform: translateY(-1px) scale(1.02);
+    box-shadow: var(--shadow-3), inset 0 1px 0 rgba(255, 255, 255, 0.26);
   }
   .rollzone:active {
-    transform: scale(0.97);
+    transform: scale(0.96);
   }
   .rollzone .cup-row {
     display: inline-flex;
-    gap: 3px;
+    gap: 5px;
   }
   .rollzone .die-face {
-    font-size: 15px;
+    font-size: 22px;
     line-height: 1;
     display: inline-block;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4));
+  }
+  /* the two cups jiggle a touch to read as "shake & throw" */
+  .rollzone .die-face:first-child {
+    animation: cup-jiggle 2.6s ease-in-out 0.6s infinite;
+  }
+  .rollzone .die-face:last-child {
+    animation: cup-jiggle 2.6s ease-in-out 0.75s infinite;
   }
   .rollzone .rolltext {
     letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  @keyframes act-pop {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.9);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+  @keyframes roll-breathe {
+    0%,
+    100% {
+      box-shadow: var(--shadow-3), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    }
+    50% {
+      box-shadow:
+        var(--shadow-3),
+        0 0 0 4px rgba(255, 232, 150, 0.16),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    }
+  }
+  @keyframes cup-jiggle {
+    0%,
+    88%,
+    100% {
+      transform: rotate(0);
+    }
+    92% {
+      transform: rotate(-12deg);
+    }
+    96% {
+      transform: rotate(10deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rollzone {
+      animation: none;
+    }
+    .rollzone .die-face {
+      animation: none;
+    }
   }
   @keyframes reveal {
     from {

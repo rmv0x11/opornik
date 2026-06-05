@@ -51,8 +51,8 @@ test('LIVE: new flow — пипсы label, confirm-to-commit, AI-dice line', asy
     { timeout: 40_000 },
   );
 
-  // A: label says "пипсы" (not "пипы")
-  await expect(page.locator('.meta')).toContainText('пипсы');
+  // A: pip readout sits right under the board and says "пипсы" (not "пипы")
+  await expect(page.locator('.pips')).toContainText('пипсы');
 
   // B/C: get to a human move (roll if a roll is pending), build a move, confirm it
   const roll1 = page.getByRole('button', { name: /Бросить кости/ });

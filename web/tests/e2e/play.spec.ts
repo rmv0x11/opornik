@@ -240,21 +240,25 @@ test('AI roll is shown as pip-dice', async ({ page }) => {
   await expect(page.locator('.ailast .minidie .mp.on').first()).toBeVisible();
 });
 
-test('resign: conceding a mars ends the game with 2 points to the engine', async ({ page }) => {
+test('resign: confirming a concession ends the game (mars = 2 pts at the start)', async ({ page }) => {
   await startAndRoll(page);
-  await page.locator('.resign summary').click();
-  await page.getByRole('button', { name: /Сдаться с марсом/ }).click();
+  await page.getByRole('button', { name: /Сдаться/ }).click(); // single button → confirm form
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
   await expect(
     page.getByRole('button', { name: /Новая партия|Следующая партия/ }),
   ).toBeVisible({ timeout: 40_000 });
   await expect(page.locator('.status')).toContainText('Сдача с марсом');
 });
 
-test('resign: оин is hidden at the start (a mars is still possible)', async ({ page }) => {
+test('resign: at the start the concession is a mars (оин not available yet)', async ({ page }) => {
   await startAndRoll(page);
-  await page.locator('.resign summary').click();
-  await expect(page.getByRole('button', { name: /Сдаться с марсом/ })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Сдаться — оин/ })).toHaveCount(0);
+  await page.getByRole('button', { name: /Сдаться/ }).click();
+  // the confirmation states the single correct outcome — марс — not оин
+  await expect(page.locator('.resign-confirm')).toContainText('марс');
+  await expect(page.locator('.resign-confirm')).not.toContainText('оин');
+  // and it can be cancelled (no game over)
+  await page.getByRole('button', { name: /Отмена/ }).click();
+  await expect(page.locator('.resign-confirm')).toHaveCount(0);
 });
 
 test('resign: оин is allowed once a checker is borne off (mars impossible)', async ({ page }) => {
@@ -287,8 +291,10 @@ test('resign: оин is allowed once a checker is borne off (mars impossible)', 
   await page.locator('.import-box').fill(saved);
   await page.getByRole('button', { name: /Продолжить с этой позиции/ }).click();
   await expect(page.locator('.board')).toBeVisible({ timeout: 40_000 });
-  await page.locator('.resign summary').click();
-  await page.getByRole('button', { name: /Сдаться — оин/ }).click();
+  await page.getByRole('button', { name: /Сдаться/ }).click();
+  // a checker is off → mars impossible → the single concession is оин (1 pt)
+  await expect(page.locator('.resign-confirm')).toContainText('оин');
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
   await expect(
     page.getByRole('button', { name: /Новая партия|Следующая партия/ }),
   ).toBeVisible({ timeout: 40_000 });
@@ -303,8 +309,9 @@ test('resign with the cube at 2 concedes double points (mars = 4)', async ({ pag
   await reachHumanRoll(page);
   await page.getByRole('button', { name: /Удвоить/ }).click({ timeout: 40_000 });
   await expect(page.locator('.cube-state')).toContainText('2', { timeout: 40_000 });
-  await page.locator('.resign summary').click();
-  await page.getByRole('button', { name: /Сдаться с марсом/ }).click();
+  await page.getByRole('button', { name: /Сдаться/ }).click();
+  await expect(page.locator('.resign-confirm')).toContainText('+4'); // mars × cube(2)
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
   await expect(page.locator('.status')).toContainText('+4', { timeout: 40_000 });
 });
 
@@ -314,8 +321,8 @@ test('match: resigning awards the points to the engine on the scoreboard', async
   await page.getByRole('button', { name: /Начать матч/ }).click();
   await doOpening(page);
   await waitOpeningReady(page); // resign is available whether the human moves or rolls
-  await page.locator('.resign summary').click();
-  await page.getByRole('button', { name: /Сдаться с марсом/ }).click();
+  await page.getByRole('button', { name: /Сдаться/ }).click();
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
   await expect(page.locator('.score')).toContainText('0:2', { timeout: 40_000 });
 });
 
@@ -326,6 +333,21 @@ test('rolling by clicking the roll prompt on the board', async ({ page }) => {
   await reachHumanRoll(page); // the side-rail roll prompt appears on the human's roll
   await expect(page.locator('.board .rollzone')).toBeVisible({ timeout: 40_000 });
   await page.locator('.board .rollzone').click();
+  await expect(page.locator('.board .point.source').first()).toBeVisible({ timeout: 40_000 });
+});
+
+test('auto-roll: once enabled the dice throw without clicking the roll prompt', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /Начать партию/ }).click();
+  await doOpening(page);
+  await waitOpeningReady(page);
+  // enable auto-roll (toggle lives in the pips row, always visible)
+  await page.getByRole('button', { name: /авто-бросок/ }).click();
+  // it auto-throws → the human gets movable sources WITHOUT us clicking «Бросить кости»
+  await page.locator('.board .point.source').first().waitFor({ timeout: 40_000 });
+  await makeHumanMove(page);
+  // after the engine replies it becomes our roll again and auto-roll fires once more —
+  // sources reappear with no manual roll click
   await expect(page.locator('.board .point.source').first()).toBeVisible({ timeout: 40_000 });
 });
 

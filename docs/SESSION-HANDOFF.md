@@ -1,7 +1,27 @@
 # Session handoff — opornik (читать первым после очистки контекста)
 
 Живой сайт: https://rmv0x11.github.io/opornik/ · деплой автоматический (правило `auto-deploy-no-ask`).
-Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.10** (`index-DWu-jilO.js`, gh-pages коммит `304f5dc`).
+Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.11** (`index-D0uCpGZJ.js`, gh-pages коммит `9f72ab9`).
+v0.9.11: **кнопки действий — по центру доски.** Кубик «бросок» переехал из рейки в
+центр поля (`Board.svelte` → новый click-through оверлей `.board-actions` внутри
+`.table`, `position:relative`; `pointer-events:none` на контейнере, `auto` на кнопках
+— построение хода не перекрывается). Roll-кнопка теперь ЕДИНАЯ: `.board .rollzone`
+с `aria-label="Бросить кости"` (удовлетворяет И CSS-селектор `.board .rollzone`, И
+`getByRole(/Бросить кости/)` — раньше это были две разные кнопки). Play передаёт
+центральные кнопки через snippet-проп `center={boardCenter}`: «Разыграть первый ход»,
+«⬆ Удвоить», «Тайк/Пас/Бивер», «✓ Подтвердить ход» (последняя — ТОЛЬКО когда ход
+полностью собран `completeSeq`, чтобы не закрывать пункты при построении). «Отменить»
+и «Выкинуть шашку» остались в нижней панели. Дубли кнопок из панели убраны (иначе
+strict-mode у getByRole ловил бы 2 совпадения). Значения костей после броска —
+по-прежнему в рейке (`Board` `.dice-slot` показывает `position.dice`).
+**Лист партии:** действия с кубом теперь пишутся в `history` (`logCube`,
+`LogEntry.cube`, строки 🎲² в логе); кнопка «📄 Скачать лист» (`.gl-save` в `.gl-head`)
+качает `.txt`-транскрипт и копирует его в буфер (`saveTranscript`/`transcriptText`).
+Имя кнопки НЕ содержит «Сохранить»/«Экспорт» — иначе strict-mode у тех тестов словил бы
+лишнее совпадение. Фикс: определены токены `--fw-semi/--fw-bold` в `App.svelte` (раньше
+`font:`-шорткаты с ними молча сбрасывались). **Движок-тулинг:** новый
+`engine-train relay`/`agree` + `.MAT`-импорт (`logasai.rs`) для спарринга с LogasAI —
+см. `docs/logasai-benchmark.md §5`. (Сам движок не трогали: pruning замерян lossless.)
 v0.9.10: «обзор лучших ходов» («Оценка») теперь всегда на виду — `analyze()` вызывается автоматически при входе в фазу `humanMove` (`enterHumanMove`/`resumeFrom`/`replayFrom` → `void analyze()`), кнопка «Оценка» убрана. (Пользователь уточнил через AskUserQuestion: имел в виду именно «Оценку» текущего хода, хотел «всегда на виду».) e2e: тесты «inline analysis auto-shows…» больше не кликают кнопку.
 v0.9.9: откатил агрессивный fit-сквиз листа партии (0.9.6–0.9.8 ужимали лог в ~1–2 строки ради no-page-scroll → обзор ходов был тесным). Теперь лог снова просторный прокручиваемый блок (`.log{max-height:clamp(200px,46dvh,340px)}` на мобиле), страница прокручивается по необходимости. `.fit` оставлен ТОЛЬКО для высоты доски (старт высокая, в партии чуть ниже: `.play.fit :global(.board){--row-h:...24rem...}`); никакого `.play.fit{height/flex}` и flex-сквиза лога больше нет. Урок: НЕ ужимать лист партии/обзор — пользователь ценит просторный обзор > отсутствие прокрутки страницы.
 v0.9.8: фикс загрузки WASM на iPhone/Safari. `WebAssembly.instantiateStreaming` в WebKit (особенно в Web Worker) кидает «Unexpected response MIME type. Expected 'application/wasm'» даже при правильном Content-Type → fallback wasm-bindgen не срабатывает (MIME правильный) → краш на айфоне. Фикс в `web/src/engine/worker.ts`: грузим wasm байтами (`fetch(wasmUrl).then(r=>r.arrayBuffer())`) и `init({module_or_path: bytes})` → идёт через `WebAssembly.instantiate` (без проверки MIME). Playwright WebKit 26.4 баг НЕ воспроизводит (грузит и через streaming), но фикс обходит проблемный путь целиком; проверено: WebKit+Chromium грузят движок без ошибок (preview и live).
@@ -54,12 +74,22 @@ preview (`tests/preview/load.spec.ts`) и live (`tests/live/smoke.spec.ts`,
 - e2e-селекторы/тексты: `.board`, `.board .point(.source/.dest/.selected/.last)`,
   `[data-cell]`, `.board .checker`, `.board .rollzone`, `.board .bar`,
   `.board .off-chip.{white,black}`, `.winbar .label`, `.gamelog .logrow .mv/.ev`,
-  `.ranked li.best`, `.ailast .minidie`, `.resign summary`, `.import`, `.save-go`,
-  `.open-res`/`.opening`, `.ptnum` (число пункта). Тексты кнопок: «Начать
-  партию/матч», «Разыграть первый ход», «Бросить кости», «Подтвердить ход»,
-  «Отменить», «Выкинуть шашку», «Оценка», «Сдаться — оин/Сдаться с марсом»,
-  «Удвоить», «Тайк/Пас/Бивер», «Продолжить с этой позиции», «Переиграть этот ход»,
-  «Понятно, играть». Меняешь разметку → синхронно правь spec'и.
+  `.ranked li.best`, `.ailast .minidie`, `.import`, `.save-go`,
+  `.open-res`/`.opening`, `.ptnum` (число пункта). v0.9.11: центральные кнопки
+  живут в `.board .board-actions` (Play-snippet, классы `.act/.act-row/.act-puck`);
+  `.gamelog` шапка теперь `.gl-head` (`.gl-summary` + `.gl-save`). `.board .rollzone`
+  единственная и имеет `aria-label="Бросить кости"`. v0.9.12: шкала шансов и обзор
+  ходов сворачиваемы; пипсы — в `.pips` сразу под доской (live-смоук проверяет
+  `.pips`, не `.meta`). v0.9.13: «⚡ авто-бросок» (тогл в `.pips`). v0.9.14: сдача —
+  ОДНА кнопка `.resign-btn` («🏳 Сдаться») → форма `.resign-confirm` («Да, сдаться» /
+  «Отмена»); `<details>`/`.resign summary` и кнопки «Сдаться — оин/с марсом» УБРАНЫ
+  (исход определяется позицией). Тексты кнопок: «Начать партию/матч», «Разыграть
+  первый ход», «Бросить кости», «Подтвердить ход», «Отменить», «Выкинуть шашку»,
+  «Оценка», «Сдаться»/«Да, сдаться», «Удвоить», «Тайк/Пас/Бивер», «Продолжить с этой
+  позиции», «Переиграть этот ход», «Понятно, играть», «📄 Скачать лист» (НЕ содержит
+  «Сохранить»/«Экспорт» — чтобы не ловить strict-mode тех тестов). Каждая боевая
+  кнопка должна быть в ОДНОМ экземпляре (центр ИЛИ панель, не оба). Меняешь разметку
+  → синхронно правь spec'и.
 - Координаты: `web/src/lib/board/coords.ts` (`phys`/`posOfPhys`).
 
 ## Состояние движка (Rust)

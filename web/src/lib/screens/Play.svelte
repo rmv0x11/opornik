@@ -171,12 +171,20 @@
   const aiColor: PlayerColor = $derived(humanColor === 'white' ? 'black' : 'white');
   const hasCube = $derived(variant === 'nardegammon' || variant === 'hachapuri');
   const canBeaver = $derived(variant === 'hachapuri');
+  // A player exactly 1 point from winning the match is at "match point": the cube is
+  // useless to them — any win already wins the match, so doubling can only RISK giving
+  // the opponent more for zero upside. They must never double. This holds in the
+  // Crawford game AND every post-Crawford game. (The Crawford game additionally bars
+  // the TRAILER from doubling, via pos.crawford.)
+  const humanOneAway = $derived(matchLength != null && matchScore[0] === matchLength - 1);
+  const aiOneAway = $derived(matchLength != null && matchScore[1] === matchLength - 1);
   const canHumanDouble = $derived(
     hasCube &&
       phase === 'humanRoll' &&
       pos != null &&
       pos.cube.value < 64 &&
       !pos.crawford &&
+      !humanOneAway &&
       (pos.cube.owner === null || pos.cube.owner === humanColor),
   );
   const doubleTo = $derived(pos ? pos.cube.value * 2 : 0); // value after a pending double
@@ -1089,6 +1097,7 @@
         pos &&
         pos.cube.value < 64 &&
         !pos.crawford &&
+        !aiOneAway &&
         (pos.cube.owner === null || pos.cube.owner === aiColor)
       ) {
         const cd = await engine.cubeDecision();
@@ -1336,6 +1345,11 @@
       {/if}
       {#if currentGameCrawford}
         <div class="crawford">⚑ Кроуфорд — удвоение запрещено</div>
+      {:else if hasCube && (humanOneAway || aiOneAway)}
+        <div class="crawford post">
+          ⚑ Пост-кроуфорд: {humanOneAway ? 'вам' : 'движку'} до матча 1 очко — куб бесполезен,
+          {humanOneAway ? 'вы не удваиваете' : 'движок не удваивает'}
+        </div>
       {/if}
 
       <div class="status-row">
@@ -1893,6 +1907,11 @@
     margin-bottom: 0.4rem;
     color: #b22;
     font-weight: 600;
+  }
+  .crawford.post {
+    color: var(--ink-muted);
+    font-weight: var(--fw-medium);
+    font-size: 0.86rem;
   }
   .status-row {
     display: flex;

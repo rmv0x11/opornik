@@ -200,6 +200,44 @@ test('nardegammon: human doubles, the AI takes (cube 1 → 2)', async ({ page })
   await expect(page.locator('.cube-state')).toContainText('у движка');
 });
 
+test('match: a player 1-away from the match cannot double (post-Crawford)', async ({ page }) => {
+  // 7-match, score 6:2 → the human is one point from winning → the cube is useless to
+  // them (any win wins the match), so «Удвоить» must NOT be offered, even though this
+  // is a post-Crawford game (crawfordPlayed=true, crawford=false). A hint explains it.
+  const saved = JSON.stringify({
+    v: 1,
+    id: 't',
+    name: 'matchpoint',
+    savedAt: '2026-06-04T00:00:00.000Z',
+    variant: 'nardegammon',
+    aiPly: 2,
+    humanColor: 'white',
+    matchLength: 7,
+    matchScore: [6, 2],
+    crawfordPlayed: true,
+    setup: {
+      variant: 'nardegammon',
+      turn: 'white',
+      white: [{ pos: 24, player: 'white', count: 15 }],
+      black: [{ pos: 24, player: 'black', count: 15 }],
+      off: [0, 0],
+      dice: null,
+      cube: { value: 1, owner: null, turned: false },
+      crawford: false,
+      turn_number: 0,
+    },
+  });
+  await page.goto('/');
+  await page.locator('.import > summary').click();
+  await page.locator('.import-box').fill(saved);
+  await page.getByRole('button', { name: /Продолжить с этой позиции/ }).click();
+  await expect(page.locator('.board')).toBeVisible({ timeout: 40_000 });
+  await expect(page.getByRole('button', { name: /Бросить кости/ })).toBeVisible({ timeout: 40_000 });
+  // at match point the cube is gone, and a post-Crawford note says why
+  await expect(page.getByRole('button', { name: /Удвоить/ })).toHaveCount(0);
+  await expect(page.locator('.crawford.post')).toContainText('Пост-кроуфорд');
+});
+
 test('match mode: scoreboard shows the target and the game is playable', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: /Матч до 7/ }).click();

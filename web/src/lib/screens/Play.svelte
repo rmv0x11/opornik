@@ -525,9 +525,16 @@
     finishGame(p.outcome.winner as PlayerColor, points, p.outcome.mars ? 'марс' : 'оин');
   }
 
-  // Mars is impossible (so a single-point оин concession is allowed) only once the
-  // human has borne off at least one checker — until then they could still be marsed.
-  const canResignSingle = $derived(pos ? (humanColor === 'white' ? pos.off[0] : pos.off[1]) >= 1 : false);
+  // Mars is impossible (so a single-point оин concession is allowed) once the human
+  // has at least one checker off. Read the DISPLAYED position so a bear-off you've
+  // already built (but not yet confirmed) counts — the board shows that checker off
+  // the board, so resigning must read оин, not марс. (Bug fix: while a bear-off was
+  // pending the off-tray showed off≥1, yet resign used the pre-move committed off
+  // and wrongly demanded a марс.)
+  const canResignSingle = $derived.by(() => {
+    const p = displayPos ?? pos;
+    return p ? (humanColor === 'white' ? p.off[0] : p.off[1]) >= 1 : false;
+  });
 
   // The human concedes the game: оин (1 pt) or марс (2 pt), times the cube.
   function resign(mars: boolean) {

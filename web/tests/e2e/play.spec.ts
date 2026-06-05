@@ -301,6 +301,54 @@ test('resign: оин is allowed once a checker is borne off (mars impossible)', 
   await expect(page.locator('.status')).toContainText('Сдача');
 });
 
+test('resign: a bear-off already built (not yet confirmed) counts as оин, not марс', async ({
+  page,
+}) => {
+  // White all home, NOTHING borne off yet (committed off=0 → mars possible), dice
+  // 2-1. Bear one checker off (pending, unconfirmed) → the board shows it off → the
+  // concession must read оин, not марс (regression guard for the displayed-vs-
+  // committed off bug).
+  const saved = JSON.stringify({
+    v: 1,
+    id: 't',
+    name: 'pending-bearoff',
+    savedAt: '2026-06-04T00:00:00.000Z',
+    variant: 'traditional',
+    aiPly: 2,
+    humanColor: 'white',
+    matchLength: null,
+    matchScore: [0, 0],
+    crawfordPlayed: false,
+    setup: {
+      variant: 'traditional',
+      turn: 'white',
+      white: [
+        { pos: 2, player: 'white', count: 1 },
+        { pos: 1, player: 'white', count: 14 },
+      ],
+      black: [{ pos: 24, player: 'black', count: 15 }],
+      off: [0, 0],
+      dice: [2, 1],
+      cube: { value: 1, owner: null, turned: false },
+      crawford: false,
+      turn_number: 50,
+    },
+  });
+  await page.goto('/');
+  await page.locator('.import > summary').click();
+  await page.locator('.import-box').fill(saved);
+  await page.getByRole('button', { name: /Продолжить с этой позиции/ }).click();
+  await expect(page.locator('.board')).toBeVisible({ timeout: 40_000 });
+  // select the point-2 checker (physical cell 22 for white) and bear it off
+  await page.locator('.board .point[data-cell="22"]').click();
+  await page.getByRole('button', { name: /Выкинуть/ }).click();
+  await page.waitForTimeout(480); // bear-off arc into the tray (BEAR_MS=440)
+  // now resign → a checker is off the board → оин, NOT марс
+  await page.getByRole('button', { name: /Сдаться/ }).click();
+  await expect(page.locator('.resign-confirm')).toContainText('оин');
+  await expect(page.locator('.resign-confirm')).not.toContainText('марс');
+});
+
 test('resign with the cube at 2 concedes double points (mars = 4)', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: /Нардегаммон/ }).click();

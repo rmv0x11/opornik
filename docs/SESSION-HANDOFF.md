@@ -1,7 +1,23 @@
 # Session handoff — opornik (читать первым после очистки контекста)
 
 Живой сайт: https://rmv0x11.github.io/opornik/ · деплой автоматический (правило `auto-deploy-no-ask`).
-Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.11** (`index-D0uCpGZJ.js`, gh-pages коммит `9f72ab9`).
+Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.19** (`index-C3lY-4j5.js`, gh-pages коммит `80e11c0`).
+
+## Сессия v0.9.11→v0.9.19 (всё задеплоено; исходники закоммичены в ветку `feature/single-player-v0.9.10`, кроме untracked `.github/workflows/deploy.yml` — GitHub отклоняет пуш файлов воркфлоу без scope `workflow`, лежит в дереве, коммить сам)
+- **v0.9.12** сворачиваемые шкала шансов + обзор ходов (тоглы запоминаются в `localStorage`); пипсы переехали к доске в `.pips` (live-смоук теперь проверяет `.pips`, не `.meta`).
+- **v0.9.13** «⚡ авто-бросок» (тогл в `.pips`); **v0.9.18** задержка авто-броска 700→350 мс.
+- **v0.9.14** сдача: одна кнопка `.resign-btn` («🏳 Сдаться») → форма `.resign-confirm` («Да, сдаться»/«Отмена»); `<details>`/`.resign summary` убраны. **v0.9.15** кнопка сдачи переехала на строку статуса (`.status-row`) и перекрашена. **v0.9.16** фикс: `canResignSingle` читает ОТОБРАЖАЕМУЮ позицию (`displayPos ?? pos`) — собранный, но не подтверждённый выкид считается → оин, а не марс.
+- **v0.9.17** честные кости: `rollDie` = `crypto.getRandomValues` + rejection-sampling (байты ≥252 отбрасываются) — строго 1/6, без modulo-bias. Панель «🎲 Кости — статистика». **v0.9.18** вкладки панели: Грани (честность), Куши (счёт всех 21 комбинации, копится в `localStorage` ключ `opornik.kushStats`), Последовательность (`rollSeq`, сессионная, история бросков вы/движок). Faces копятся в `opornik.diceStats`. `recordRoll()` вызывается в humanRoll/aiRoll(!preset)/doOpeningRoll.
+- **v0.9.19** КУБ НА МАТЧ-ПОЙНТЕ: игрок в 1 очке от матча (`humanOneAway`/`aiOneAway` = `matchScore[x]===matchLength-1`) больше НЕ удваивает (куб бесполезен) — добавлено в `canHumanDouble` и в гейт двойного у движка (`aiTurn`); пометка `.crawford.post`. Сама игра Кроуфорда (`pos.crawford`) и так была корректна. e2e: «match: a player 1-away … cannot double».
+
+## Движок + LogasAI (основная задача — продолжаем позже)
+- **Тулинг готов** (`engine-train relay`/`agree`/`.MAT`, `crates/engine-train/src/logasai.rs`, тесты) — см. `docs/logasai-benchmark.md §5`. Способ мерить нас против LogasAI, когда будут его партии.
+- **n-ply self-play обучение добавлено** (`--selfplay-plies`, `engine-train/src/lib.rs` `self_play_episode(.., plies)`; 1 = старый TD(0)).
+- **Базовый ER чемпиона** (`models/nardy-net.bin`): 1-ply **0.0739** / 2-ply **0.0695** (150×80 роллаутов).
+- **Эксперимент 2-ply self-play fine-tune (3600 партий, warm-start, lr 0.012) — НУЛЕВОЙ результат, чемпион оставлен.** Дуэль vs чемпион: 1-ply **50.5%** (ничья), 2-ply **47.0%** (чуть хуже); ER нового нета 0.088/0.087 (ХУЖЕ). Подтверждает плато. Дешёвый вариант (2-ply ВЫБОР хода, 1-ply ЦЕЛЬ) не помогает.
+- **Следующие рычаги (не сделаны):** (а) 2-ply ЦЕЛИ обучения (не только выбор) — логичный следующий шаг; (б) фичи блокировки/прайма в кодировке + переобучение с нуля; (в) AlphaZero (policy+value+MCTS); (г) реальные партии LogasAI → `agree` → точечно. Решение за пользователем.
+- ⚠️ Обучение: НЕ делать `renice +N` процессу обучения — macOS под нагрузкой зажимает nice+15 до 1 ядра (потеряли ~50 мин). Запускать на nice 0; 2-ply self-play ≈ ~1 партия/с на 9 ядрах (3600 партий ≈ ~60 мин).
+
 v0.9.11: **кнопки действий — по центру доски.** Кубик «бросок» переехал из рейки в
 центр поля (`Board.svelte` → новый click-through оверлей `.board-actions` внутри
 `.table`, `position:relative`; `pointer-events:none` на контейнере, `auto` на кнопках

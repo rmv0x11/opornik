@@ -26,11 +26,14 @@ pub mod bearoff;
 pub mod board;
 pub mod cube;
 pub mod encoding;
+pub mod encoding2;
 pub mod eval;
 pub mod game;
 pub mod matchplay;
 pub mod moves;
 pub mod net;
+pub mod net2;
+pub mod phase;
 pub mod player;
 pub mod search;
 
@@ -51,7 +54,10 @@ pub use matchplay::{MatchState, MoneyGame, STANDARD_MATCH_LENGTHS};
 pub use moves::{
     creates_illegal_prime, generate_turns, generate_turns_cfg, legal_sequences, CheckerMove, Turn,
 };
+pub use encoding2::{CONTACT_INPUTS, RACE_INPUTS};
 pub use net::{Net, OUTPUTS};
+pub use net2::{NetV2, PhaseNets, OUTPUTS_V2};
+pub use phase::{contact_for, has_contact};
 pub use player::Player;
 pub use search::{
     best_turn_search, best_turn_search_budget, best_turn_search_width, position_equity,

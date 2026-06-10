@@ -39,3 +39,4 @@ net.bin
 /web/dist/
 test-results/
 playwright-report/
+train/.venv/

@@ -404,17 +404,7 @@ impl Phase {
     }
 }
 
-/// True while an opponent checker stands on a cell some checker of `player`
-/// has yet to cross (i.e. blocking interaction is still possible for them).
-fn contact_for(board: &Board, player: Player) -> bool {
-    let highest = board.highest_occupied(player);
-    (1..highest).any(|q| board.opp_at(player, q) > 0)
-}
-
-/// Whether any blocking interaction remains possible for either side.
-pub fn has_contact(board: &Board) -> bool {
-    contact_for(board, Player::White) || contact_for(board, Player::Black)
-}
+pub use engine_core::phase::has_contact;
 
 /// Classify a decision position (priority: bearoff > race > head > contact).
 /// `Head` uses a simple heuristic: the mover still has 8+ checkers stacked on

@@ -893,6 +893,157 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Convert a rollout-labelled dataset TSV into the binary feature matrices the
+/// PyTorch trainer consumes: one file per phase net, routed by the SAME
+/// dispatch the in-play evaluator uses (`has_contact` → contact, else race —
+/// bear-off rows train the race net's fallback). Binary layout (little-endian):
+/// `b"NNF2"  u32 version=1  u32 dim  u32 n`, then `n` rows of
+/// `dim` f32 features + 4 f32 target probs. `train/train_v2.py` reads this.
+fn cmd_encode(args: &[String]) -> ExitCode {
+    use engine_core::encoding2::{encode_contact_into, encode_race_into, CONTACT_INPUTS, RACE_INPUTS};
+    use engine_core::has_contact;
+
+    let input = str_arg(args, "--in", "");
+    let prefix = str_arg(args, "--out-prefix", "");
+    if input.is_empty() || prefix.is_empty() {
+        eprintln!("encode: need --in dataset.tsv --out-prefix PATH");
+        return ExitCode::FAILURE;
+    }
+    let Ok(text) = std::fs::read_to_string(&input) else {
+        eprintln!("encode: cannot read {input}");
+        return ExitCode::FAILURE;
+    };
+
+    let mut contact_rows: Vec<f32> = Vec::new();
+    let mut race_rows: Vec<f32> = Vec::new();
+    let (mut n_contact, mut n_race, mut bad) = (0usize, 0usize, 0usize);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        // pos-spec, phase, p_win_oin, p_win_mars, p_lose_oin, p_lose_mars, trials
+        if cols.len() < 6 {
+            bad += 1;
+            continue;
+        }
+        let (Some((board, mover, _, _)), Ok(p0), Ok(p1), Ok(p2), Ok(p3)) = (
+            parse_pos_line(cols[0]),
+            cols[2].parse::<f32>(),
+            cols[3].parse::<f32>(),
+            cols[4].parse::<f32>(),
+            cols[5].parse::<f32>(),
+        ) else {
+            bad += 1;
+            continue;
+        };
+        if has_contact(&board) {
+            let at = contact_rows.len();
+            contact_rows.resize(at + CONTACT_INPUTS, 0.0);
+            encode_contact_into(&board, mover, &mut contact_rows[at..]);
+            contact_rows.extend_from_slice(&[p0, p1, p2, p3]);
+            n_contact += 1;
+        } else {
+            let at = race_rows.len();
+            race_rows.resize(at + RACE_INPUTS, 0.0);
+            encode_race_into(&board, mover, &mut race_rows[at..]);
+            race_rows.extend_from_slice(&[p0, p1, p2, p3]);
+            n_race += 1;
+        }
+    }
+
+    let write = |path: &str, dim: usize, n: usize, rows: &[f32]| -> std::io::Result<()> {
+        let mut out = Vec::with_capacity(16 + rows.len() * 4);
+        out.extend_from_slice(b"NNF2");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(dim as u32).to_le_bytes());
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        for v in rows {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, out)
+    };
+    let cpath = format!("{prefix}-contact.bin");
+    let rpath = format!("{prefix}-race.bin");
+    if let Err(e) = write(&cpath, CONTACT_INPUTS, n_contact, &contact_rows)
+        .and_then(|()| write(&rpath, RACE_INPUTS, n_race, &race_rows))
+    {
+        eprintln!("encode: write failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "Encoded {input}: {n_contact} contact rows → {cpath} (dim {CONTACT_INPUTS}), \
+         {n_race} race rows → {rpath} (dim {RACE_INPUTS}){}",
+        if bad > 0 { format!(", {bad} bad lines skipped") } else { String::new() }
+    );
+    ExitCode::SUCCESS
+}
+
+/// Forward-pass speed: champion v1 net vs the v2 phase nets (stage-1 gate:
+/// the v2 stack must stay within the play-time budget).
+fn cmd_netbench(args: &[String]) -> ExitCode {
+    use engine_core::net2::{NetV2, PhaseNets, OUTPUTS_V2};
+    use engine_core::search::Evaluator;
+    use engine_core::{CONTACT_INPUTS, RACE_INPUTS};
+
+    let iters = arg(args, "--iters", 20_000usize);
+    let v1 = load_net(&str_arg(args, "--in", "models/nardy-net.bin"))
+        .unwrap_or_else(|| Net::standard(80, 1));
+    let v2_path = str_arg(args, "--v2", "");
+    let v2 = if v2_path.is_empty() {
+        PhaseNets::new(
+            NetV2::random(&[CONTACT_INPUTS, 300, 250, 200, OUTPUTS_V2], 11),
+            NetV2::random(&[RACE_INPUTS, 300, 250, 200, OUTPUTS_V2], 22),
+        )
+        .expect("valid shapes")
+    } else {
+        let Some(p) = std::fs::read(&v2_path).ok().and_then(|b| PhaseNets::from_bytes(&b))
+        else {
+            eprintln!("netbench: cannot load NV2P pair from {v2_path}");
+            return ExitCode::FAILURE;
+        };
+        println!("loaded v2 pair from {v2_path}");
+        p
+    };
+
+    // Interop probe: the same synthetic input train/train_v2.py prints after
+    // export — the two outputs must match to ~1e-6 or the export is broken
+    // (e.g. transposed weights produce garbage without crashing).
+    let probe = |dim: usize| -> Vec<f32> {
+        (0..dim).map(|i| ((i * 7) % 23) as f32 / 23.0).collect()
+    };
+    println!("probe contact: {:?}", v2.contact.forward(&probe(CONTACT_INPUTS)));
+    println!("probe race:    {:?}", v2.race.forward(&probe(RACE_INPUTS)));
+
+    let board = Board::starting();
+    let bench = |label: &str, f: &dyn Fn() -> f32| {
+        let t0 = std::time::Instant::now();
+        let mut acc = 0.0f32;
+        for _ in 0..iters {
+            acc += f();
+        }
+        let dt = t0.elapsed();
+        println!(
+            "  {label:<32} {:>8.2} µs/eval  ({iters} iters, checksum {acc:.3})",
+            dt.as_secs_f64() * 1e6 / iters as f64
+        );
+        dt
+    };
+    let dims: Vec<String> = std::iter::once(v2.contact.input().to_string())
+        .chain(v2.contact.layers.iter().map(|l| l.output.to_string()))
+        .collect();
+    let v2_label = format!("v2 PhaseNets {}", dims.join("-"));
+    println!("Forward-pass benchmark:");
+    let t1 = bench("v1 Net 196-80-3", &|| v1.equity(&board, Player::White));
+    let t2 = bench(&v2_label, &|| v2.equity(&board, Player::White));
+    println!(
+        "  ratio: v2 is {:.1}× slower per eval (plan budget: ~10× absorbed by top-4 root pruning + SIMD)",
+        t2.as_secs_f64() / t1.as_secs_f64()
+    );
+    ExitCode::SUCCESS
+}
+
 /// Relay: read position+roll lines from stdin and print the engine's best plays.
 /// Pair with LogasAI — type its position and roll, mirror our move, record the
 /// result. One position per line; blank lines and `#` comments are skipped.
@@ -1064,12 +1215,14 @@ fn main() -> ExitCode {
         Some("endbench") => cmd_endbench(&args[1..]),
         Some("er") => cmd_er(&args[1..]),
         Some("dataset") => cmd_dataset(&args[1..]),
+        Some("encode") => cmd_encode(&args[1..]),
+        Some("netbench") => cmd_netbench(&args[1..]),
         Some("diag2") => cmd_diag2(&args[1..]),
         Some("relay") => cmd_relay(&args[1..]),
         Some("agree") => cmd_agree(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--stratify K] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E] [--exclude EVALSET]   (rollout-labelled training data)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
+                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--stratify K] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E] [--exclude EVALSET]   (rollout-labelled training data)\n  engine-train encode --in dataset.tsv --out-prefix PATH   (TSV → NNF2 feature matrices for train/train_v2.py)\n  engine-train netbench [--in PATH] [--iters N]   (v1 vs v2 forward-pass speed)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
             );
             ExitCode::FAILURE
         }

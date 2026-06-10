@@ -121,9 +121,12 @@
   let analysisOpen = $state(loadPref('opornik.analysisOpen', true)); // best-moves panel shown
   let autoRoll = $state(loadPref('opornik.autoRoll', false)); // roll the dice automatically
   let soundOn = $state(loadPref('opornik.sound', true)); // synthesized sound effects
+  // auto-commit: a fully built move plays itself — no «Подтвердить ход» click
+  let autoCommit = $state(loadPref('opornik.autoCommit', false));
   $effect(() => savePref('opornik.barOpen', barOpen));
   $effect(() => savePref('opornik.analysisOpen', analysisOpen));
   $effect(() => savePref('opornik.autoRoll', autoRoll));
+  $effect(() => savePref('opornik.autoCommit', autoCommit));
   $effect(() => {
     savePref('opornik.sound', soundOn);
     setSoundEnabled(soundOn);
@@ -146,6 +149,19 @@
     }
     if (!act) return;
     const t = setTimeout(act, 350);
+    return () => clearTimeout(t);
+  });
+  // Auto-commit: when enabled, a fully built move confirms itself after a short
+  // beat (long enough to see the placement — and to undo by changing the build:
+  // any change to the sequence/animation cancels the pending timer via cleanup).
+  $effect(() => {
+    if (!autoCommit || phase !== 'humanMove' || animating || !completeSeq) return;
+    const id = completeSeq.turn_id;
+    const t = setTimeout(() => {
+      if (autoCommit && phase === 'humanMove' && !animating && completeSeq?.turn_id === id) {
+        void play(id, true);
+      }
+    }, 300);
     return () => clearTimeout(t);
   });
   function snap(p: PositionDto): PositionDto {
@@ -1407,7 +1423,7 @@
             {#if canBeaver}<button class="act ghost-act" onclick={cubeBeaver}>Бивер</button>{/if}
           </div>
         </div>
-      {:else if phase === 'humanMove' && completeSeq}
+      {:else if phase === 'humanMove' && completeSeq && !autoCommit}
         <button class="act primary" onclick={confirmMove}>✓ Подтвердить ход</button>
       {/if}
     {/snippet}
@@ -1445,6 +1461,14 @@
           onclick={() => (autoRoll = !autoRoll)}
           title="Бросать кости автоматически"
         >⚡ авто-бросок{autoRoll ? ' ✓' : ''}</button>
+        <button
+          type="button"
+          class="auto-toggle"
+          class:on={autoCommit}
+          aria-pressed={autoCommit}
+          onclick={() => (autoCommit = !autoCommit)}
+          title="Собранный ход подтверждается сам — без кнопки «Подтвердить ход»"
+        >✓ авто-ход{autoCommit ? ' ✓' : ''}</button>
         <button
           type="button"
           class="auto-toggle"

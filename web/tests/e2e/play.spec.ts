@@ -344,6 +344,32 @@ test('post-game review: replaying a move out of a finished game takes the awarde
   await expect(page.locator('.postgame')).toHaveCount(0);
 });
 
+test('auto-commit: with «✓ авто-ход» enabled a fully built move plays itself', async ({
+  page,
+}) => {
+  await startAndRoll(page);
+  await page.getByRole('button', { name: /авто-ход/ }).click(); // enable the toggle
+  // build a move with clicks only — never press «Подтвердить ход» (it is not shown)
+  for (let i = 0; i < 24; i++) {
+    if ((await page.locator('.gamelog .logrow.me').count()) > 0) break;
+    const dst = page.locator('.board .point.dest');
+    if ((await dst.count()) > 0) {
+      await dst.first().click();
+      await page.waitForTimeout(380); // glide (300) + part of the auto-commit beat
+      continue;
+    }
+    const src = page.locator('.board .point.source');
+    if ((await src.count()) > 0) {
+      await src.first().click();
+      continue;
+    }
+    await page.waitForTimeout(150); // mid-animation / pending auto-commit — retry
+  }
+  // the move committed by itself: it landed in the game log
+  await expect(page.locator('.gamelog .logrow.me').first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole('button', { name: /Подтвердить ход/ })).toHaveCount(0);
+});
+
 test('resign: оин is allowed once a checker is borne off (mars impossible)', async ({ page }) => {
   // White has already borne off → cannot be marsed → оин allowed.
   const saved = JSON.stringify({

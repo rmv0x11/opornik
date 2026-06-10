@@ -64,6 +64,10 @@ pub struct TrainConfig {
     /// Search depth used to SELECT moves during self-play (1 = greedy 1-ply, the
     /// classic TD(0); >1 = stronger behaviour policy à la TD-Gammon 2.0, slower).
     pub selfplay_plies: u8,
+    /// Depth of the bootstrap TARGET (1 = net(s_{t+1}), the classic TD(0) target;
+    /// 2 = roll-averaged best-reply lookahead of s_{t+1} à la TD-Gammon 2.1 —
+    /// distills 2-ply search values into the static eval, ~20× slower per step).
+    pub target_plies: u8,
 }
 
 impl Default for TrainConfig {
@@ -75,6 +79,7 @@ impl Default for TrainConfig {
             explore: 0.05,
             seed: 0xC0FFEE,
             selfplay_plies: 1,
+            target_plies: 1,
         }
     }
 }
@@ -100,16 +105,62 @@ fn win_target(mars: bool) -> [f32; 3] {
     [1.0, if mars { 1.0 } else { 0.0 }, 0.0]
 }
 
+/// Cubeless equity of a `[win, win_mars, lose_mars]` probability vector.
+#[inline]
+fn vec_equity(v: [f32; 3]) -> f32 {
+    2.0 * v[0] - 1.0 + v[1] - v[2]
+}
+
+/// One-roll lookahead value of `board` for `to_move` (who is about to roll), as a
+/// `[win, win_mars, lose_mars]` vector from `to_move`'s perspective: the weighted
+/// average over the 21 rolls of the net's probabilities for the equity-best reply
+/// (exact `[1, mars, 0]` when the best reply ends the game). Used as the 2-ply
+/// TD target — one true ply deeper than the plain `net(s_{t+1})` bootstrap.
+fn lookahead_probs(net: &Net, board: &Board, to_move: Player, first_turn: bool) -> [f32; 3] {
+    let next = to_move.opponent();
+    let mut acc = [0.0f32; 3];
+    for d1 in 1..=6u8 {
+        for d2 in d1..=6u8 {
+            let weight = if d1 == d2 { 1.0 } else { 2.0 };
+            let turns = generate_turns_cfg(board, to_move, [d1, d2], first_turn, HEAD_LIMIT);
+            let mut best_eq = f32::NEG_INFINITY;
+            let mut best_v = [0.0f32; 3];
+            for t in &turns {
+                let v = match outcome(&t.board) {
+                    // `to_move` just played; a finished game here is their win.
+                    Outcome::Win { mars, .. } => win_target(mars),
+                    _ => {
+                        let p = net.evaluate_board(&t.board, next);
+                        [1.0 - p.win, p.lose_mars, p.win_mars]
+                    }
+                };
+                let eq = vec_equity(v);
+                if eq > best_eq {
+                    best_eq = eq;
+                    best_v = v;
+                }
+            }
+            for (a, b) in acc.iter_mut().zip(best_v) {
+                *a += weight * b;
+            }
+        }
+    }
+    acc.map(|a| a / 36.0)
+}
+
 /// Play one self-play game, applying TD updates in place. Returns the game length.
 /// `plies` is the move-selection search depth (1 = greedy; >1 = deeper behaviour
-/// policy). The TD target stays a 1-ply bootstrap (cheap); only the *play* is
-/// stronger, which shifts training toward better state distributions.
+/// policy, which shifts training toward better state distributions). `target_plies`
+/// picks the TD target: 1 = the cheap `net(s_{t+1})` bootstrap; 2 = the roll-averaged
+/// best-reply lookahead of s_{t+1} ([`lookahead_probs`]), distilling search into
+/// the static eval.
 pub fn self_play_episode(
     net: &mut Net,
     rng: &mut Rng,
     lr: f32,
     explore: f32,
     plies: u8,
+    target_plies: u8,
 ) -> usize {
     let mut board = Board::starting();
     let mut mover = Player::White;
@@ -142,9 +193,15 @@ pub fn self_play_episode(
             // board-only `outcome` never yields Draw (training uses Traditional rules)
             Outcome::Draw => return ply + 1,
             Outcome::Ongoing => {
-                // Bootstrap: target = net(s_{t+1}) viewed from the mover's side.
+                // Bootstrap: target = value of s_{t+1} viewed from the mover's side
+                // (plain net output, or its one-roll lookahead at target_plies >= 2).
                 let opp = mover.opponent();
-                let o = net.forward(&encode(&next_board, opp));
+                let o = if target_plies >= 2 {
+                    lookahead_probs(net, &next_board, opp, first[opp.index()])
+                } else {
+                    let raw = net.forward(&encode(&next_board, opp));
+                    [raw[0], raw[1], raw[2]]
+                };
                 let target = [1.0 - o[0], o[2], o[1]];
                 net.train_step(&x_t, &target, lr);
                 board = next_board;
@@ -162,7 +219,14 @@ pub fn train(cfg: TrainConfig, verbose: bool) -> Net {
     let step = (cfg.games / 20).max(1);
     let mut total_len = 0usize;
     for g in 0..cfg.games {
-        total_len += self_play_episode(&mut net, &mut rng, cfg.lr, cfg.explore, cfg.selfplay_plies);
+        total_len += self_play_episode(
+            &mut net,
+            &mut rng,
+            cfg.lr,
+            cfg.explore,
+            cfg.selfplay_plies,
+            cfg.target_plies,
+        );
         if verbose && (g + 1) % step == 0 {
             let avg = total_len as f32 / (g + 1) as f32;
             println!("  trained {:>7}/{} games (avg len {:.0})", g + 1, cfg.games, avg);
@@ -228,10 +292,11 @@ pub fn train_parallel(
                     .wrapping_mul(0x2545F491_4F6CDD1D)
                     .wrapping_add((round as u64).wrapping_mul(0x9E37_79B9) ^ (t as u64 + 1));
                 let plies = cfg.selfplay_plies;
+                let target_plies = cfg.target_plies;
                 std::thread::spawn(move || {
                     let mut rng = Rng::new(seed);
                     for _ in 0..sync {
-                        self_play_episode(&mut local, &mut rng, lr, explore, plies);
+                        self_play_episode(&mut local, &mut rng, lr, explore, plies, target_plies);
                     }
                     local
                 })
@@ -419,6 +484,7 @@ mod tests {
             explore: 0.0,
             seed: 1,
             selfplay_plies: 1,
+            target_plies: 1,
         };
         let net = train(cfg, false);
         let net_policy = SearchPolicy { eval: net, plies: 1 };

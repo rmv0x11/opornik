@@ -13,6 +13,7 @@
   } from '../../engine/types';
   import Board from '../board/Board.svelte';
   import { phys, posOfPhys } from '../board/coords';
+  import { setSoundEnabled, sfx } from '../sound';
   import { exportGame, newId, saveGame, type SavedGame } from '../storage';
 
   let {
@@ -119,9 +120,14 @@
   let barOpen = $state(loadPref('opornik.barOpen', true)); // win-probability bar shown
   let analysisOpen = $state(loadPref('opornik.analysisOpen', true)); // best-moves panel shown
   let autoRoll = $state(loadPref('opornik.autoRoll', false)); // roll the dice automatically
+  let soundOn = $state(loadPref('opornik.sound', true)); // synthesized sound effects
   $effect(() => savePref('opornik.barOpen', barOpen));
   $effect(() => savePref('opornik.analysisOpen', analysisOpen));
   $effect(() => savePref('opornik.autoRoll', autoRoll));
+  $effect(() => {
+    savePref('opornik.sound', soundOn);
+    setSoundEnabled(soundOn);
+  });
   // Auto-roll: when enabled, throw the dice automatically a beat after it becomes
   // your roll (and auto-play the opening throw). The short delay lets you SEE the
   // turn and still double first (the double button is up during the delay); the
@@ -158,6 +164,75 @@
     const s = sev(h.loss);
     const word = s === 'blunder' ? 'ошибка' : s === 'inacc' ? 'неточность' : '';
     return `−${h.loss.toFixed(3)}${word ? ' · ' + word : ''}`;
+  }
+
+  // ---- post-game review (Разбор партии) ----
+  // Structured result of the finished game; `winnerIsHuman: null` = draw.
+  let gameResult = $state<{ winnerIsHuman: boolean | null; points: number } | null>(null);
+  // Human checker moves the engine managed to score (loss != null). Cube entries
+  // and AI moves carry no real loss (AI loss is hardcoded 0), so they are excluded.
+  const scoredMoves = $derived(
+    history
+      .map((h, idx) => ({ idx, h }))
+      .filter(({ h }) => h.isHuman && !h.cube && h.loss != null),
+  );
+  const reviewStats = $derived.by(() => {
+    if (!scoredMoves.length) return null;
+    let best = 0;
+    let inacc = 0;
+    let blunder = 0;
+    let total = 0;
+    for (const { h } of scoredMoves) {
+      const l = h.loss!;
+      total += l;
+      if (l < 0.0005) best++;
+      const s = sev(l);
+      if (s === 'inacc') inacc++;
+      else if (s === 'blunder') blunder++;
+    }
+    return { n: scoredMoves.length, best, inacc, blunder, avg: total / scoredMoves.length };
+  });
+  // Light-hearted skill label from the mean equity loss per scored move.
+  function gradeLabel(avg: number): string {
+    if (avg < 0.01) return 'мировой класс';
+    if (avg < 0.02) return 'эксперт';
+    if (avg < 0.04) return 'сильный игрок';
+    if (avg < 0.07) return 'крепкий любитель';
+    if (avg < 0.12) return 'любитель';
+    return 'новичок';
+  }
+  const worstMoves = $derived(
+    scoredMoves
+      .filter(({ h }) => h.loss! >= 0.02)
+      .sort((a, b) => b.h.loss! - a.h.loss!)
+      .slice(0, 3),
+  );
+  // Your win chance after every checker move (AI entries flipped to your side),
+  // closed with the actual result — the data behind the review sparkline.
+  const sparkPoints = $derived.by(() => {
+    const pts: number[] = [];
+    for (const h of history) {
+      if (h.cube || h.win == null) continue;
+      pts.push(h.isHuman ? h.win : 1 - h.win);
+    }
+    if (gameResult && gameResult.winnerIsHuman != null) {
+      pts.push(gameResult.winnerIsHuman ? 1 : 0);
+    }
+    if (pts.length < 2) return '';
+    const last = pts.length - 1;
+    return pts
+      .map((p, i) => `${((i / last) * 100).toFixed(2)},${(2 + (1 - p) * 24).toFixed(2)}`)
+      .join(' ');
+  });
+  // Jump from the review panel to a move's expanded log entry.
+  function openReview(idx: number) {
+    logOpen = true;
+    reviewIdx = idx;
+    setTimeout(() => {
+      document
+        .querySelector(`.gamelog .log li:nth-child(${idx + 1})`)
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }, 30);
   }
 
   const ANIM_MS = 300; // matches the board glide (pick-up → travel → settle)
@@ -372,6 +447,7 @@
         animating = true;
         glide = { from: phys(humanColor, h.from), to: -1, color: humanColor, bearOff: true };
         pending = [...pending, h];
+        sfx.bear();
         await delay(BEAR_MS);
         glide = null;
         animating = false;
@@ -379,11 +455,18 @@
         animating = true;
         glide = { from: phys(humanColor, h.from), to: phys(humanColor, h.to), color: humanColor };
         pending = [...pending, h];
+        sfx.move();
         await delay(ANIM_MS);
         glide = null;
         animating = false;
       } else {
         pending = [...pending, h];
+        // non-animated hops land in the same instant — voice the gesture once,
+        // not one stacked click per hop
+        if (h === hops[0]) {
+          if (h.bear_off) sfx.bear();
+          else sfx.move();
+        }
       }
     }
     // keep the checker selected if it can still move (smooth chaining), else clear
@@ -503,6 +586,7 @@
   // Record one throw (a pair) by `who`. Per-die fairness counts are bumped in
   // rollDie; this adds the combination + sequence.
   function recordRoll(who: 'you' | 'opp', a: number, b: number, opening = false) {
+    if (!opening) sfx.dice(); // the opening throw sounds when its dice APPEAR (doOpeningRoll)
     rollSeq = [...rollSeq, { who, a, b, opening }];
     const k = kushKey(a, b);
     kushStats[k] = (kushStats[k] ?? 0) + 1;
@@ -618,10 +702,15 @@
     ];
   }
 
-  function finishGame(winner: PlayerColor, points: number, reason: string) {
+  function finishGame(winner: PlayerColor, points: number, reason: string, silent = false) {
     if (winner === humanColor) matchScore[0] += points;
     else matchScore[1] += points;
     if (currentGameCrawford) crawfordPlayed = true;
+    gameResult = { winnerIsHuman: winner === humanColor, points };
+    if (!silent) {
+      if (winner === humanColor) sfx.win();
+      else sfx.lose();
+    }
     if (matchLength != null && (matchScore[0] >= matchLength || matchScore[1] >= matchLength)) {
       const humanWon = matchScore[0] >= matchLength;
       status = `${humanWon ? '🏆 Вы выиграли матч!' : 'Матч за движком.'} Счёт ${matchScore[0]}:${matchScore[1]}.`;
@@ -632,18 +721,21 @@
     phase = 'over';
   }
 
-  function announceBoardWin(p: PositionDto) {
+  // `silent` suppresses the win/lose jingle — used when RESTORING an already
+  // finished game (save/import), where the result is old news, not an event.
+  function announceBoardWin(p: PositionDto, silent = false) {
     if (p.outcome.kind === 'draw') {
       // Classic last-roll equalisation: both sides borne off — no points.
       if (currentGameCrawford) crawfordPlayed = true;
       status = `Ничья — обе стороны вывели все шашки${
         matchLength != null ? ` (матч ${matchScore[0]}:${matchScore[1]})` : ''
       }.`;
+      gameResult = { winnerIsHuman: null, points: 0 };
       phase = 'over';
       return;
     }
     const points = (p.outcome.points ?? 1) * p.cube.value;
-    finishGame(p.outcome.winner as PlayerColor, points, p.outcome.mars ? 'марс' : 'оин');
+    finishGame(p.outcome.winner as PlayerColor, points, p.outcome.mars ? 'марс' : 'оин', silent);
   }
 
   // Mars is impossible (so a single-point оин concession is allowed) once the human
@@ -707,7 +799,7 @@
     currentGameCrawford = !!g.setup.crawford;
     await updateWin();
     if (isOver(pos)) {
-      announceBoardWin(pos);
+      announceBoardWin(pos, true); // restored result — no jingle
       return;
     }
     if (pos.turn === humanColor) {
@@ -747,6 +839,7 @@
       opp = rollDie();
     }
     openRoll = { you, opp };
+    sfx.dice(); // the dice are visible NOW; recordRoll below runs after the pause
     status = `Вы: ${you} · соперник: ${opp}`;
     await delay(1100); // let the player read the dice
     const humanFirst = you > opp;
@@ -779,7 +872,7 @@
       pos = await engine.setCrawford(currentGameCrawford);
       await updateWin();
       if (isOver(pos)) {
-        announceBoardWin(pos);
+        announceBoardWin(pos, true); // restored result — no jingle
         return;
       }
       startOpeningRoll();
@@ -924,6 +1017,15 @@
   async function rewindTo(idx: number): Promise<boolean> {
     const e = history[idx];
     if (!e) return false;
+    // Replaying out of a FINISHED game (the review panel invites this): take back
+    // what finishGame already awarded, otherwise the replayed game's own finish
+    // would double-count the score (and could falsely end a match).
+    if (phase === 'over' && gameResult) {
+      if (gameResult.winnerIsHuman === true) matchScore[0] -= gameResult.points;
+      else if (gameResult.winnerIsHuman === false) matchScore[1] -= gameResult.points;
+      if (currentGameCrawford) crawfordPlayed = false;
+    }
+    gameResult = null;
     reviewIdx = null;
     clearAnalysis();
     clearMoveBuild();
@@ -1131,6 +1233,8 @@
       }
       cur = posWithMoves(cur, color, [mv]);
       aiAnim = cur;
+      if (bear) sfx.bear();
+      else sfx.move();
       await delay(bear ? BEAR_MS : ANIM_MS);
       glide = null;
     }
@@ -1227,6 +1331,7 @@
       aiAnim = null;
       history = [];
       reviewIdx = null;
+      gameResult = null;
       pos = await engine.reset();
       currentGameCrawford = crawfordForNext();
       pos = await engine.setCrawford(currentGameCrawford);
@@ -1339,6 +1444,14 @@
           onclick={() => (autoRoll = !autoRoll)}
           title="Бросать кости автоматически"
         >⚡ авто-бросок{autoRoll ? ' ✓' : ''}</button>
+        <button
+          type="button"
+          class="auto-toggle"
+          class:on={soundOn}
+          aria-pressed={soundOn}
+          onclick={() => (soundOn = !soundOn)}
+          title="Звуковые эффекты"
+        >{soundOn ? '🔊' : '🔇'} звук</button>
       </div>
       {#if hasCube}
         <div class="cube-state">🎲² Куб: <strong>{pos.cube.value}</strong> ({cubeOwnerDesc(pos)})</div>
@@ -1498,6 +1611,55 @@
             </button>
           {/if}
           <button class="ghost" onclick={onExit}>В меню</button>
+        </div>
+      {/if}
+
+      {#if phase === 'over' && reviewStats}
+        <div class="postgame">
+          <div class="pg-head">
+            Разбор партии
+            {#if gameResult}
+              <span
+                class="pg-res"
+                class:won={gameResult.winnerIsHuman === true}
+                class:lost={gameResult.winnerIsHuman === false}
+              >
+                {gameResult.winnerIsHuman == null
+                  ? 'ничья'
+                  : gameResult.winnerIsHuman
+                    ? `победа +${gameResult.points}`
+                    : `поражение −${gameResult.points}`}
+              </span>
+            {/if}
+          </div>
+          {#if sparkPoints}
+            <svg class="pg-chart" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">
+              <line x1="0" y1="14" x2="100" y2="14" class="pg-mid" />
+              <polyline points={sparkPoints} class="pg-line" />
+            </svg>
+            <div class="pg-axis">ваши шансы по ходам партии (50% — пунктир)</div>
+          {/if}
+          <div class="pg-stats">
+            <span class="pg-stat good">✓ лучших: {reviewStats.best}/{reviewStats.n}</span>
+            <span class="pg-stat warn">неточностей: {reviewStats.inacc}</span>
+            <span class="pg-stat bad">ошибок: {reviewStats.blunder}</span>
+          </div>
+          <div class="pg-grade">
+            точность {reviewStats.avg.toFixed(3)} экв./ход — {gradeLabel(reviewStats.avg)}
+          </div>
+          {#if worstMoves.length}
+            <div class="pg-worst">
+              <span class="pg-cap">главные потери (нажмите, чтобы разобрать):</span>
+              {#each worstMoves as w (w.idx)}
+                <button type="button" class="pg-row" onclick={() => openReview(w.idx)}>
+                  <span class="pg-mv">
+                    №{w.h.n}{w.h.dice ? ` · ${w.h.dice[0]}-${w.h.dice[1]}` : ''} · {w.h.notation}
+                  </span>
+                  <span class="pg-loss">−{w.h.loss!.toFixed(3)}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
 
@@ -2313,6 +2475,114 @@
     margin: 0.35rem 0 0;
     font-size: 0.74rem;
     color: #a08a6a;
+  }
+  /* post-game review panel */
+  .postgame {
+    margin-top: 0.9rem;
+    border: 1px solid #e2d3bb;
+    border-radius: 8px;
+    background: #fcf8f1;
+    padding: 0.6rem 0.7rem 0.65rem;
+  }
+  .pg-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.6rem;
+    font: var(--fw-semi) 0.95rem var(--font-ui);
+    color: #6b4423;
+    margin-bottom: 0.45rem;
+  }
+  .pg-res {
+    font: var(--fw-semi) 0.85rem var(--font-ui);
+    color: #8a6a48;
+  }
+  .pg-res.won {
+    color: #2e7d32;
+  }
+  .pg-res.lost {
+    color: #b0413e;
+  }
+  .pg-chart {
+    display: block;
+    width: 100%;
+    height: 56px;
+    border: 1px solid #ecdfc9;
+    border-radius: 6px;
+    background: #fffdf8;
+  }
+  .pg-mid {
+    stroke: #d8c7a8;
+    stroke-width: 0.5;
+    stroke-dasharray: 2 2;
+  }
+  .pg-line {
+    fill: none;
+    stroke: #2e7d32;
+    stroke-width: 1.1;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+  }
+  .pg-axis {
+    font: 400 0.7rem var(--font-ui);
+    color: #a08a6c;
+    margin: 0.15rem 0 0.45rem;
+  }
+  .pg-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.9rem;
+    font: 400 0.85rem var(--font-ui);
+    color: #5a4632;
+  }
+  .pg-stat.good {
+    color: #2e7d32;
+  }
+  .pg-stat.warn {
+    color: #b07d2a;
+  }
+  .pg-stat.bad {
+    color: #b0413e;
+  }
+  .pg-grade {
+    margin-top: 0.35rem;
+    font: var(--fw-semi) 0.85rem var(--font-ui);
+    color: #6b4423;
+  }
+  .pg-worst {
+    margin-top: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .pg-cap {
+    font: 400 0.78rem var(--font-ui);
+    color: #a08a6c;
+  }
+  .pg-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.6rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid #ecdfc9;
+    border-radius: 6px;
+    background: #fffdf8;
+    cursor: pointer;
+    font: 400 0.85rem var(--font-mono, monospace);
+    color: #5a4632;
+  }
+  .pg-row:hover {
+    background: #f6efe2;
+    border-color: #d8c7a8;
+  }
+  .pg-loss {
+    font: var(--fw-semi) 0.85rem var(--font-mono, monospace);
+    color: #b0413e;
+    white-space: nowrap;
   }
   .gamelog {
     margin-top: 0.9rem;

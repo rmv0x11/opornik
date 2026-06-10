@@ -50,7 +50,13 @@ fn cmd_train(args: &[String]) -> ExitCode {
         explore: arg(args, "--explore", 0.05),
         seed: arg(args, "--seed", 0xC0FFEE),
         selfplay_plies: arg(args, "--selfplay-plies", 1u8),
+        target_plies: arg(args, "--target-plies", 1u8),
     };
+    if !(1..=2).contains(&cfg.target_plies) {
+        // only the 1-ply bootstrap and the 2-ply lookahead target are implemented
+        eprintln!("--target-plies must be 1 or 2 (got {})", cfg.target_plies);
+        return ExitCode::FAILURE;
+    }
     let out = str_arg(args, "--out", "net.bin");
     let threads = arg(args, "--threads", default_threads());
     let sync = arg(args, "--sync", 200);
@@ -73,8 +79,17 @@ fn cmd_train(args: &[String]) -> ExitCode {
     };
 
     println!(
-        "Training: {} games, hidden {}, lr {}, explore {}, seed {}, threads {}, sync {}",
-        cfg.games, cfg.hidden, cfg.lr, cfg.explore, cfg.seed, threads, sync
+        "Training: {} games, hidden {}, lr {}, explore {}, seed {}, threads {}, sync {}, \
+         selfplay-plies {}, target-plies {}",
+        cfg.games,
+        cfg.hidden,
+        cfg.lr,
+        cfg.explore,
+        cfg.seed,
+        threads,
+        sync,
+        cfg.selfplay_plies,
+        cfg.target_plies
     );
     let net = train_parallel(cfg, threads, sync, init, true);
 

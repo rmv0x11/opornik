@@ -299,6 +299,51 @@ test('resign: at the start the concession is a mars (оин not available yet)',
   await expect(page.locator('.resign-confirm')).toHaveCount(0);
 });
 
+test('post-game review: a summary panel with accuracy stats appears when the game ends', async ({
+  page,
+}) => {
+  await startAndRoll(page);
+  await makeHumanMove(page); // one scored human move in the log
+  // wait for the AI reply to finish, then concede on our next turn
+  await page.getByRole('button', { name: /Сдаться/ }).click({ timeout: 40_000 });
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
+  const panel = page.locator('.postgame');
+  await expect(panel).toBeVisible({ timeout: 40_000 });
+  await expect(panel).toContainText('Разбор партии');
+  await expect(panel).toContainText('поражение'); // structured result of the concession
+  await expect(panel).toContainText('экв./ход'); // accuracy line over scored moves
+  await expect(panel.locator('.pg-stat.good')).toContainText('лучших');
+  // if the move lost equity, the worst-moves list jumps to that log entry
+  const worst = panel.locator('.pg-row');
+  if ((await worst.count()) > 0) {
+    await worst.first().click();
+    await expect(page.locator('.gamelog .logrow.active').first()).toBeVisible();
+    await expect(page.locator('.gamelog .review').first()).toBeVisible();
+  }
+  // starting the next game clears the review panel
+  await page.getByRole('button', { name: /Новая партия|Следующая партия/ }).click();
+  await expect(panel).toHaveCount(0);
+});
+
+test('post-game review: replaying a move out of a finished game takes the awarded points back', async ({
+  page,
+}) => {
+  await startAndRoll(page);
+  await makeHumanMove(page);
+  await page.getByRole('button', { name: /Сдаться/ }).click({ timeout: 40_000 });
+  await page.getByRole('button', { name: /Да, сдаться/ }).click();
+  await expect(page.locator('.postgame')).toBeVisible({ timeout: 40_000 });
+  await expect(page.locator('.score')).toContainText('счёт 0:2'); // mars concession = 2 pts
+  // replay our move straight out of the finished game (the review panel invites this)
+  await page.locator('.gamelog .logrow.me').first().click();
+  await page.getByRole('button', { name: /Переиграть этот ход/ }).click();
+  await expect(page.locator('.status')).toContainText('Переиграйте');
+  // the concession's 2 points were rolled back — the score line is blank again, the
+  // panel is gone; finishing the replayed game must not double-count
+  await expect(page.locator('.score')).toHaveText(/^\s*$/);
+  await expect(page.locator('.postgame')).toHaveCount(0);
+});
+
 test('resign: оин is allowed once a checker is borne off (mars impossible)', async ({ page }) => {
   // White has already borne off → cannot be marsed → оин allowed.
   const saved = JSON.stringify({

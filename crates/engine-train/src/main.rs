@@ -742,8 +742,11 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
     let chunk = positions.len().div_ceil(threads);
     let net_ref = &net;
     let table = &table;
-    // per-thread partials: ([er1, er2, er_leaf, er_floor], [a1, a2, a_leaf, a_floor], cnt)
-    let mut partials: Vec<([f64; 4], [usize; 4], usize)> = Vec::new();
+    // per-thread partials:
+    // ([er1, er2, er_leaf, er_floor], sumsq per chooser, [a1..a_floor],
+    //  paired (r2 - r_leaf) sum, its sumsq, cnt)
+    type Partial = ([f64; 4], [f64; 4], [usize; 4], f64, f64, usize);
+    let mut partials: Vec<Partial> = Vec::new();
     std::thread::scope(|s| {
         let handles: Vec<_> = positions
             .chunks(chunk)
@@ -752,7 +755,9 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
                 let offset = ci * chunk;
                 s.spawn(move || {
                     let mut ers = [0.0f64; 4];
+                    let mut sq = [0.0f64; 4];
                     let mut agrees = [0usize; 4];
+                    let (mut pair, mut pairsq) = (0.0f64, 0.0f64);
                     let mut cnt = 0usize;
                     for (j, (board, mover, dice)) in slice.iter().enumerate() {
                         // per-position seed: results independent of core count
@@ -807,13 +812,20 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
 
                         let i1 = best_index(net_ref, &turns, *mover, 0);
                         let i2 = best_index(net_ref, &turns, *mover, 1);
+                        let mut regrets = [0.0f64; 4];
                         for (slot, idx) in [i1, i2, best_rl.0, floor_idx].into_iter().enumerate() {
-                            ers[slot] += f64::from((best - eqs[idx]).max(0.0));
+                            let r = f64::from((best - eqs[idx]).max(0.0));
+                            regrets[slot] = r;
+                            ers[slot] += r;
+                            sq[slot] += r * r;
                             agrees[slot] += usize::from(idx == best_idx);
                         }
+                        let d = regrets[1] - regrets[2]; // net-2ply minus rollout-leaf
+                        pair += d;
+                        pairsq += d * d;
                         cnt += 1;
                     }
-                    (ers, agrees, cnt)
+                    (ers, sq, agrees, pair, pairsq, cnt)
                 })
             })
             .collect();
@@ -822,27 +834,45 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
         }
     });
 
-    let (ers, agrees, cnt) = partials.into_iter().fold(
-        ([0.0f64; 4], [0usize; 4], 0usize),
-        |(mut e, mut a, c), p| {
+    let (ers, sq, agrees, pair, pairsq, cnt) = partials.into_iter().fold(
+        ([0.0f64; 4], [0.0f64; 4], [0usize; 4], 0.0f64, 0.0f64, 0usize),
+        |(mut e, mut q, mut a, ps, pq, c), p| {
             for k in 0..4 {
                 e[k] += p.0[k];
-                a[k] += p.1[k];
+                q[k] += p.1[k];
+                a[k] += p.2[k];
             }
-            (e, a, c + p.2)
+            (e, q, a, ps + p.3, pq + p.4, c + p.5)
         },
     );
     let c = cnt.max(1) as f64;
-    let [er1, er2, erl, erf] = ers.map(|e| e / c);
+    let mean = ers.map(|e| e / c);
+    let se: Vec<f64> = (0..4)
+        .map(|k| ((sq[k] / c - mean[k] * mean[k]).max(0.0) / c).sqrt())
+        .collect();
+    let [er1, er2, erl, erf] = mean;
     let pct = |a: usize| 100.0 * a as f64 / c;
     println!(
         "\n2-ply leaf diagnostic ({cnt} decisions, truth {truth_trials} trials, leaves {leaf_trials} trials, {:.0}s):",
         t0.elapsed().as_secs_f32()
     );
-    println!("  net 1-ply:           ER {er1:.4}  agree {:.1}%", pct(agrees[0]));
-    println!("  net 2-ply:           ER {er2:.4}  agree {:.1}%", pct(agrees[1]));
-    println!("  2-ply rollout-leaf:  ER {erl:.4}  agree {:.1}%", pct(agrees[2]));
-    println!("  noise floor:         ER {erf:.4}  agree {:.1}%   (same-budget re-rollout argmax)", pct(agrees[3]));
+    println!("  net 1-ply:           ER {er1:.4} ±{:.4}  agree {:.1}%", se[0], pct(agrees[0]));
+    println!("  net 2-ply:           ER {er2:.4} ±{:.4}  agree {:.1}%", se[1], pct(agrees[1]));
+    println!("  2-ply rollout-leaf:  ER {erl:.4} ±{:.4}  agree {:.1}%", se[2], pct(agrees[2]));
+    println!(
+        "  noise floor:         ER {erf:.4} ±{:.4}  agree {:.1}%   (same-budget re-rollout argmax)",
+        se[3],
+        pct(agrees[3])
+    );
+    // Paired per-decision difference: the cleanest signal — both choosers are
+    // charged against the SAME truth realization, so the winner's-curse bias
+    // cancels and only selection quality remains.
+    let pmean = pair / c;
+    let pse = ((pairsq / c - pmean * pmean).max(0.0) / c).sqrt();
+    let z = if pse > 0.0 { pmean / pse } else { 0.0 };
+    println!(
+        "  paired (net2ply − rollout-leaf): {pmean:+.4} ± {pse:.4}  (z = {z:+.2})"
+    );
     let ex2 = er2 - erf;
     let exl = erl - erf;
     println!(
@@ -850,8 +880,10 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
     );
     println!(
         "  → verdict: {}",
-        if ex2 <= 0.005 {
-            "net 2-ply is already within noise of the rollout floor — diagnostic inconclusive at this budget (raise --trials)"
+        if z >= 2.0 {
+            "rollout leaves SIGNIFICANTLY outperform net leaves at 2-ply → the net's leaf errors are SYSTEMATIC (encoding/training limit)"
+        } else if ex2 <= 0.005 && z.abs() < 2.0 {
+            "inconclusive: net 2-ply is within noise of the rollout floor and the paired difference is not significant (raise --trials/--positions)"
         } else if exl < 0.4 * ex2 {
             "rollout leaves recover most of the 2-ply excess → the net's leaf errors are SYSTEMATIC (encoding/training limit)"
         } else {

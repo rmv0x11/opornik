@@ -372,6 +372,131 @@ pub fn rollout_equity(
     (mean, (var / nn).sqrt())
 }
 
+// ---- Phase classification & rollout labels (engine-v2 tooling) -------------
+
+/// Game phase of a decision, for stratifying datasets and error reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Early game: the mover still has a big head stack to unload.
+    Head,
+    /// The sides still interact — blocking play is possible.
+    Contact,
+    /// Paths fully disengaged but not all checkers home yet (running game).
+    Race,
+    /// Both sides have every checker in the home board (bear-off race).
+    Bearoff,
+}
+
+impl Phase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Head => "head",
+            Phase::Contact => "contact",
+            Phase::Race => "race",
+            Phase::Bearoff => "bearoff",
+        }
+    }
+}
+
+/// True while an opponent checker stands on a cell some checker of `player`
+/// has yet to cross (i.e. blocking interaction is still possible for them).
+fn contact_for(board: &Board, player: Player) -> bool {
+    let highest = board.highest_occupied(player);
+    (1..highest).any(|q| board.opp_at(player, q) > 0)
+}
+
+/// Whether any blocking interaction remains possible for either side.
+pub fn has_contact(board: &Board) -> bool {
+    contact_for(board, Player::White) || contact_for(board, Player::Black)
+}
+
+/// Classify a decision position (priority: bearoff > race > head > contact).
+/// `Head` uses a simple heuristic: the mover still has 8+ checkers stacked on
+/// the head (own path position 24) — the unload phase of the opening.
+pub fn phase_of(board: &Board, mover: Player) -> Phase {
+    if board.all_home(Player::White) && board.all_home(Player::Black) {
+        Phase::Bearoff
+    } else if !has_contact(board) {
+        Phase::Race
+    } else if board.own_at(mover, 24) >= 8 {
+        Phase::Head
+    } else {
+        Phase::Contact
+    }
+}
+
+/// Roll a position out `trials` times under the net's 1-ply policy and return
+/// outcome probabilities `[win_oin, win_mars, lose_oin, lose_mars]` from
+/// `start_mover`'s perspective (rows sum to 1). Unlike [`rollout_once`], races
+/// are truncated with the exact bear-off table only once BOTH sides have borne
+/// off a checker — from there a mars is impossible, so the table's race equity
+/// converts exactly to `P(win)` and the label stays unbiased.
+pub fn rollout_probs(
+    net: &Net,
+    table: &BearoffTable,
+    start: &Board,
+    start_mover: Player,
+    trials: usize,
+    rng: &mut Rng,
+) -> [f32; 4] {
+    let mut acc = [0.0f64; 4];
+    for _ in 0..trials {
+        let mut board = start.clone();
+        let mut mover = start_mover;
+        let mut settled = false;
+        for _ in 0..MAX_PLIES {
+            if let Outcome::Win { winner, mars, .. } = outcome(&board) {
+                let k = match (winner == start_mover, mars) {
+                    (true, false) => 0,
+                    (true, true) => 1,
+                    (false, false) => 2,
+                    (false, true) => 3,
+                };
+                acc[k] += 1.0;
+                settled = true;
+                break;
+            }
+            if table.is_race(&board)
+                && board.off[Player::White.index()] > 0
+                && board.off[Player::Black.index()] > 0
+            {
+                if let Some(e) = table.race_equity(&board, mover) {
+                    let e = if mover == start_mover { e } else { -e };
+                    let p_win = (f64::from(e) + 1.0) * 0.5;
+                    let p_win = p_win.clamp(0.0, 1.0);
+                    acc[0] += p_win;
+                    acc[2] += 1.0 - p_win;
+                    settled = true;
+                    break;
+                }
+            }
+            let dice = rng.dice();
+            let turns = generate_turns_cfg(&board, mover, dice, false, HEAD_LIMIT);
+            let idx = greedy(net, &turns, mover);
+            board = turns[idx].board.clone();
+            mover = mover.opponent();
+        }
+        if !settled {
+            // safety-cap exhaustion (never seen in practice): call it a toss-up
+            acc[0] += 0.5;
+            acc[2] += 0.5;
+        }
+    }
+    let n = trials.max(1) as f64;
+    [
+        (acc[0] / n) as f32,
+        (acc[1] / n) as f32,
+        (acc[2] / n) as f32,
+        (acc[3] / n) as f32,
+    ]
+}
+
+/// Cubeless points equity of a `[win_oin, win_mars, lose_oin, lose_mars]`
+/// probability vector (оин = 1 point, марс = 2).
+pub fn probs4_equity(p: [f32; 4]) -> f32 {
+    p[0] + 2.0 * p[1] - p[2] - 2.0 * p[3]
+}
+
 // ---- Benchmarking ----------------------------------------------------------
 
 /// A move-choosing policy for benchmark games.
@@ -441,6 +566,41 @@ impl BenchResult {
     pub fn ppg(&self) -> f32 {
         self.points as f32 / self.games as f32
     }
+    /// 95% Wilson score interval for the true win rate — robust at the sample
+    /// sizes duels actually use (hundreds of games), unlike the normal interval.
+    pub fn ci95(&self) -> (f32, f32) {
+        let n = self.games as f64;
+        if n == 0.0 {
+            return (0.0, 1.0);
+        }
+        let p = self.wins as f64 / n;
+        let z = 1.959_964; // 97.5th percentile of the standard normal
+        let z2 = z * z;
+        let denom = 1.0 + z2 / n;
+        let centre = (p + z2 / (2.0 * n)) / denom;
+        let half = (z / denom) * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+        (
+            (centre - half).max(0.0) as f32,
+            (centre + half).min(1.0) as f32,
+        )
+    }
+    /// Two-sided p-value (normal approximation) against a fair 50/50 match —
+    /// "could this win rate be a coin flip?".
+    pub fn p_value_vs_even(&self) -> f64 {
+        let n = self.games as f64;
+        if n == 0.0 {
+            return 1.0;
+        }
+        let z = ((self.wins as f64 - 0.5 * n).abs() / (0.5 * n.sqrt())).min(40.0);
+        // standard normal tail via the Abramowitz–Stegun 7.1.26 erf approximation
+        let t = 1.0 / (1.0 + 0.327_591_1 * (z / std::f64::consts::SQRT_2));
+        let poly = t
+            * (0.254_829_592
+                + t * (-0.284_496_736
+                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+        let erf = 1.0 - poly * (-(z / std::f64::consts::SQRT_2).powi(2)).exp();
+        (1.0 - erf).clamp(0.0, 1.0)
+    }
 }
 
 /// Benchmark policy `a` against policy `b` over `games`, alternating colours.
@@ -504,5 +664,64 @@ mod tests {
         let b = SearchPolicy { eval: Heuristic, plies: 1 };
         let r = benchmark(&a, &b, 60, 7);
         assert!((0.3..0.7).contains(&r.win_rate()));
+    }
+
+    #[test]
+    fn phase_classification() {
+        // The starting position: full head stacks, paths interleaved → the
+        // mover is in the head-unload phase and contact exists.
+        let start = Board::starting();
+        assert!(has_contact(&start));
+        assert_eq!(phase_of(&start, Player::White), Phase::Head);
+
+        // A disengaged running game: each side still outside its home but with
+        // no opponent checker ahead on its remaining path → pure race.
+        let mut race = Board::empty();
+        race.place(Player::White, 8, 15);
+        race.place(Player::Black, 8, 15);
+        assert!(!has_contact(&race));
+        assert!(!race.all_home(Player::White));
+        assert_eq!(phase_of(&race, Player::White), Phase::Race);
+        assert_eq!(phase_of(&race, Player::Black), Phase::Race);
+
+        // Everything home on both sides → bear-off, whoever is on roll.
+        let mut bo = Board::empty();
+        bo.place(Player::White, 3, 15);
+        bo.place(Player::Black, 3, 15);
+        assert_eq!(phase_of(&bo, Player::White), Phase::Bearoff);
+        assert_eq!(phase_of(&bo, Player::Black), Phase::Bearoff);
+    }
+
+    #[test]
+    fn rollout_probs_sum_to_one_and_match_equity_scale() {
+        let net = Net::standard(16, 3);
+        let table = BearoffTable::build_capped(3);
+        let mut board = Board::empty();
+        board.place(Player::White, 2, 2);
+        board.place(Player::Black, 6, 2);
+        board.off = [13, 13];
+        let mut rng = Rng::new(11);
+        let p = rollout_probs(&net, &table, &board, Player::White, 40, &mut rng);
+        let sum: f32 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "probs must sum to 1, got {sum}");
+        // White bears off from 2 with 2 checkers vs black's 2 on 6: white is a
+        // heavy favourite, and with both sides part-borne-off a mars is impossible.
+        assert!(p[0] > 0.7, "white should be winning, got {p:?}");
+        assert_eq!(p[1], 0.0);
+        assert_eq!(p[3], 0.0);
+        assert!(probs4_equity(p) > 0.4);
+    }
+
+    #[test]
+    fn wilson_ci_and_p_value_sanity() {
+        let even = BenchResult { games: 400, wins: 200, points: 0 };
+        let (lo, hi) = even.ci95();
+        assert!(lo < 0.5 && hi > 0.5);
+        assert!(even.p_value_vs_even() > 0.9);
+
+        let strong = BenchResult { games: 400, wins: 240, points: 80 };
+        let (lo, _) = strong.ci95();
+        assert!(lo > 0.5, "60% over 400 games is significantly above even");
+        assert!(strong.p_value_vs_even() < 0.01);
     }
 }

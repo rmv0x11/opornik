@@ -13,7 +13,7 @@ use engine_core::game::{outcome, Outcome};
 use engine_core::moves::{generate_turns_cfg, Turn};
 use engine_core::net::Net;
 use engine_core::player::Player;
-use engine_core::search::{best_turn_search, Evaluator};
+use engine_core::search::{best_turn_search, position_equity, Evaluator};
 
 /// Sparring + agreement/ER tooling for benchmarking against LogasAI.
 pub mod logasai;
@@ -318,7 +318,10 @@ pub fn train_parallel(
 
 /// Play a position out to the end once under the net's 1-ply policy, truncating
 /// pure races with the exact bear-off table (variance reduction). Returns the
-/// equity from `start_mover`'s perspective.
+/// equity from `start_mover`'s perspective. The truncation applies only once
+/// BOTH sides have borne off a checker: the table's race equity is win/loss
+/// only (capped at ±1), so truncating while a mars is still live would
+/// silently compress ±2 outcomes — the same gate `rollout_probs` uses.
 pub fn rollout_once(
     net: &Net,
     table: &BearoffTable,
@@ -336,7 +339,10 @@ pub fn rollout_once(
                 -(points as f32)
             };
         }
-        if table.is_race(&board) {
+        if table.is_race(&board)
+            && board.off[Player::White.index()] > 0
+            && board.off[Player::Black.index()] > 0
+        {
             if let Some(e) = table.race_equity(&board, mover) {
                 return if mover == start_mover { e } else { -e };
             }
@@ -495,6 +501,242 @@ pub fn rollout_probs(
 /// probability vector (оин = 1 point, марс = 2).
 pub fn probs4_equity(p: [f32; 4]) -> f32 {
     p[0] + 2.0 * p[1] - p[2] - 2.0 * p[3]
+}
+
+// ---- Measurement tooling (shared by er / diag2 / dataset) -------------------
+
+/// Index of the turn maximising the net's equity at the given lookahead
+/// (`extra_plies` beyond the resulting position; 0 = static 1-ply).
+pub fn best_index(net: &Net, turns: &[Turn], mover: Player, extra_plies: u8) -> usize {
+    let opp = mover.opponent();
+    let mut bi = 0;
+    let mut be = f32::NEG_INFINITY;
+    for (i, t) in turns.iter().enumerate() {
+        let e = -position_equity(net, &t.board, opp, extra_plies, HEAD_LIMIT);
+        if e > be {
+            be = e;
+            bi = i;
+        }
+    }
+    bi
+}
+
+/// Roll-averaged rollout value of the position after `mover`'s candidate move
+/// (`after`), from `mover`'s perspective: for each of the 21 opponent rolls the
+/// opponent makes their net-greedy best reply, and the resulting leaf is scored
+/// by `leaf_trials` truncated rollouts. A candidate that already ENDS the game
+/// is returned at its exact point value — expanding "replies" to a finished
+/// game would let the loser bear off a checker and demote a mars to an oin
+/// (or, with both off-counts at 15, even flip the recorded winner).
+pub fn rollout_leaf_value(
+    net: &Net,
+    table: &BearoffTable,
+    after: &Board,
+    mover: Player,
+    leaf_trials: usize,
+    rng: &mut Rng,
+) -> f32 {
+    if let Outcome::Win { winner, points, .. } = outcome(after) {
+        return if winner == mover {
+            points as f32
+        } else {
+            -(points as f32)
+        };
+    }
+    let opp = mover.opponent();
+    let mut val = 0.0f32;
+    for d1 in 1..=6u8 {
+        for d2 in d1..=6u8 {
+            let w = if d1 == d2 { 1.0 } else { 2.0 };
+            let replies = generate_turns_cfg(after, opp, [d1, d2], false, HEAD_LIMIT);
+            let ri = best_index(net, &replies, opp, 0);
+            let leaf = &replies[ri].board;
+            val += w * rollout_equity(net, table, leaf, mover, leaf_trials, rng).0;
+        }
+    }
+    val / 36.0
+}
+
+/// Sample `m` decision positions (>1 legal play) from the net's own 1-ply
+/// greedy self-play — the position source for `er`/`diag2`.
+///
+/// Sampling discipline (each point fixes a measured bias):
+/// * literal first turns are skipped — their head-doubles exception (3-3/4-4/
+///   6-6) widens the legal turn set, but labelling/scoring regenerate turns
+///   with `first=false`, so recording them would score a different decision
+///   than the one faced;
+/// * at most `per_game` decisions per game, thinned to ~1 in 8 — without this,
+///   200 "positions" are just two consecutive games' trajectories;
+/// * with `min_phase > 0`, sampling continues past `m` until every phase
+///   (head/contact/race/bearoff) has at least `min_phase` decisions, so
+///   per-phase error reports don't rest on n=4 buckets.
+pub fn sample_decisions(
+    net: &Net,
+    m: usize,
+    seed: u64,
+    per_game: usize,
+    min_phase: usize,
+) -> Vec<(Board, Player, [u8; 2])> {
+    use std::collections::HashMap;
+    let mut rng = Rng::new(seed);
+    let mut out: Vec<(Board, Player, [u8; 2])> = Vec::with_capacity(m);
+    let mut phase_counts: HashMap<Phase, usize> = HashMap::new();
+    let quotas_met = |pc: &HashMap<Phase, usize>| {
+        [Phase::Head, Phase::Contact, Phase::Race, Phase::Bearoff]
+            .iter()
+            .all(|p| pc.get(p).copied().unwrap_or(0) >= min_phase)
+    };
+    let mut games = 0usize;
+    while (out.len() < m || (min_phase > 0 && !quotas_met(&phase_counts))) && games < 4000 {
+        games += 1;
+        let mut board = Board::starting();
+        let mut mover = Player::White;
+        let mut first = [true, true];
+        let mut taken = 0usize;
+        for _ in 0..600 {
+            if !matches!(outcome(&board), Outcome::Ongoing) {
+                break;
+            }
+            let dice = rng.dice();
+            let fst = first[mover.index()];
+            let turns = generate_turns_cfg(&board, mover, dice, fst, HEAD_LIMIT);
+            first[mover.index()] = false;
+            if !fst && turns.len() > 1 && taken < per_game && rng.unit() < 0.125 {
+                let phase = phase_of(&board, mover);
+                let need_total = out.len() < m;
+                let need_phase = min_phase > 0
+                    && phase_counts.get(&phase).copied().unwrap_or(0) < min_phase;
+                if need_total || need_phase {
+                    out.push((board.clone(), mover, dice));
+                    *phase_counts.entry(phase).or_insert(0) += 1;
+                    taken += 1;
+                }
+            }
+            let idx = best_index(net, &turns, mover, 0);
+            board = turns[idx].board.clone();
+            mover = mover.opponent();
+        }
+    }
+    out
+}
+
+// ---- One-line position specs & canonical turn keys --------------------------
+
+/// Parse `"pos:count,pos:count,…"` (the player's own 1..24 path coords) into
+/// `board`. Malformed tokens are skipped.
+pub fn parse_side(spec: &str, player: Player, board: &mut Board) {
+    for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some((p, c)) = tok.split_once(':') {
+            if let (Ok(pos), Ok(cnt)) = (p.trim().parse::<u8>(), c.trim().parse::<u8>()) {
+                if (1..=24).contains(&pos) {
+                    board.place(player, pos, cnt);
+                }
+            }
+        }
+    }
+}
+
+/// `"B"`/`"black"` (any case) → Black, anything else → White.
+pub fn parse_player(s: &str) -> Player {
+    if s.eq_ignore_ascii_case("b") || s.eq_ignore_ascii_case("black") {
+        Player::Black
+    } else {
+        Player::White
+    }
+}
+
+/// Canonical key of a turn: the sorted multiset of its checker moves
+/// (`from>to`, bear-off as `from>0`). Distinct resulting boards always get
+/// distinct keys (transposing orders are already merged by the generator),
+/// unlike the human notation, whose chain-collapse can be ambiguous.
+pub fn turn_key(t: &Turn) -> String {
+    if t.moves.is_empty() {
+        return "pass".to_string();
+    }
+    let mut segs: Vec<String> = t
+        .moves
+        .iter()
+        .map(|m| format!("{}>{}", m.from, if m.bear_off { 0 } else { m.to }))
+        .collect();
+    segs.sort_unstable();
+    segs.join(",")
+}
+
+/// Inverse of [`parse_pos_line`]: one-line position spec. The `first` flag is
+/// not represented — consumers relabel with `first=false`, which is why
+/// samplers must never record literal first turns.
+pub fn format_pos_line(board: &Board, turn: Player, dice: Option<[u8; 2]>) -> String {
+    let side = |p: Player| -> String {
+        let mut segs = Vec::new();
+        for pos in (1..=24u8).rev() {
+            let c = board.own_at(p, pos);
+            if c > 0 {
+                segs.push(format!("{pos}:{c}"));
+            }
+        }
+        segs.join(",")
+    };
+    let mut s = format!(
+        "white={} black={} turn={}",
+        side(Player::White),
+        side(Player::Black),
+        if turn == Player::White { "W" } else { "B" }
+    );
+    let (wo, bo) = (
+        board.off[Player::White.index()],
+        board.off[Player::Black.index()],
+    );
+    if wo > 0 {
+        s.push_str(&format!(" white-off={wo}"));
+    }
+    if bo > 0 {
+        s.push_str(&format!(" black-off={bo}"));
+    }
+    if let Some(d) = dice {
+        s.push_str(&format!(" dice={},{}", d[0], d[1]));
+    }
+    s
+}
+
+/// Parse a one-line position spec:
+///   `white=24:13,18:2 black=24:15 turn=W [dice=3,1] [white-off=N] [black-off=N] [first]`
+/// Returns `None` unless at least one `white=`/`black=` token is present.
+/// `dice` is optional — `dataset` rows are pre-roll states; callers that need
+/// a roll (relay/agree/er --load) must demand `Some` themselves.
+pub fn parse_pos_line(spec: &str) -> Option<(Board, Player, Option<[u8; 2]>, bool)> {
+    let mut board = Board::empty();
+    let mut turn = Player::White;
+    let mut dice: Option<[u8; 2]> = None;
+    let mut first = false;
+    let mut saw_side = false;
+    for tok in spec.split_whitespace() {
+        let (k, v) = tok.split_once('=').unwrap_or((tok, ""));
+        match k {
+            "white" => {
+                saw_side = true;
+                parse_side(v, Player::White, &mut board);
+            }
+            "black" => {
+                saw_side = true;
+                parse_side(v, Player::Black, &mut board);
+            }
+            "white-off" => board.off[Player::White.index()] = v.parse().unwrap_or(0),
+            "black-off" => board.off[Player::Black.index()] = v.parse().unwrap_or(0),
+            "turn" => turn = parse_player(v),
+            "dice" => {
+                let d: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if d.len() == 2 {
+                    dice = Some([d[0], d[1]]);
+                }
+            }
+            "first" => first = v.is_empty() || v.eq_ignore_ascii_case("true") || v == "1",
+            _ => {}
+        }
+    }
+    if !saw_side {
+        return None;
+    }
+    Some((board, turn, dice, first))
 }
 
 // ---- Benchmarking ----------------------------------------------------------
@@ -710,6 +952,112 @@ mod tests {
         assert_eq!(p[1], 0.0);
         assert_eq!(p[3], 0.0);
         assert!(probs4_equity(p) > 0.4);
+    }
+
+    #[test]
+    fn rollout_once_keeps_playing_while_a_mars_is_live() {
+        // White bears off its last checker on ANY roll while Black (all home,
+        // nothing borne off) is being marsed — a certain +2. The old truncation
+        // called race_equity as soon as both sides were all home and capped the
+        // result at +1; the mars gate (both off-counts > 0) must let the
+        // rollout play to the actual end and return exactly +2.
+        let net = Net::standard(16, 5);
+        let table = BearoffTable::build_capped(6);
+        let mut board = Board::empty();
+        board.place(Player::White, 1, 1);
+        board.place(Player::Black, 6, 15);
+        board.off = [14, 0];
+        let mut rng = Rng::new(42);
+        let (mean, se) = rollout_equity(&net, &table, &board, Player::White, 8, &mut rng);
+        assert_eq!(mean, 2.0, "a certain mars must be +2, got {mean}");
+        assert_eq!(se, 0.0);
+    }
+
+    #[test]
+    fn rollout_leaf_value_short_circuits_finished_games() {
+        let net = Net::standard(16, 9);
+        let table = BearoffTable::build_capped(3);
+
+        // Black has just borne off its last checker; White has 14 off + 1 left.
+        // The value for Black must be exactly +1 (oin) — no phantom White
+        // "reply" that would bear off the last checker and flip the winner.
+        let mut won = Board::empty();
+        won.place(Player::White, 1, 1);
+        won.off = [14, 15];
+        let mut rng = Rng::new(1);
+        let v = rollout_leaf_value(&net, &table, &won, Player::Black, 4, &mut rng);
+        assert_eq!(v, 1.0, "Black's finished oin must be +1, got {v}");
+
+        // White wins a mars (opponent all home, 0 off): exactly +2 — a phantom
+        // Black reply would demote it to ~+1.
+        let mut mars = Board::empty();
+        mars.place(Player::Black, 6, 15);
+        mars.off = [15, 0];
+        let v = rollout_leaf_value(&net, &table, &mars, Player::White, 4, &mut rng);
+        assert_eq!(v, 2.0, "White's finished mars must be +2, got {v}");
+    }
+
+    #[test]
+    fn sample_decisions_skips_first_turns_and_spans_many_games() {
+        let net = Net::standard(16, 21);
+        let positions = sample_decisions(&net, 40, 7, 4, 0);
+        assert_eq!(positions.len(), 40);
+        // Literal first turns are excluded, so the starting position (each
+        // game's only White first-turn decision) must never be recorded.
+        let start = Board::starting();
+        assert!(
+            positions.iter().all(|(b, _, _)| *b != start),
+            "first-turn decisions must be skipped"
+        );
+        // With a per-game cap of 4, 40 decisions need at least 10 games.
+        let unique: std::collections::HashSet<_> =
+            positions.iter().map(|(b, p, _)| (b.clone(), *p)).collect();
+        assert!(unique.len() > 30, "sample should span many games, not one trajectory");
+    }
+
+    #[test]
+    fn sample_decisions_stratified_fills_phase_quotas() {
+        let net = Net::standard(16, 33);
+        let positions = sample_decisions(&net, 24, 13, 6, 4);
+        let mut counts: std::collections::HashMap<Phase, usize> = Default::default();
+        for (b, p, _) in &positions {
+            *counts.entry(phase_of(b, *p)).or_insert(0) += 1;
+        }
+        for phase in [Phase::Head, Phase::Contact, Phase::Race, Phase::Bearoff] {
+            assert!(
+                counts.get(&phase).copied().unwrap_or(0) >= 4,
+                "phase {phase:?} quota unfilled: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pos_line_round_trips_exactly() {
+        let mut board = Board::empty();
+        board.place(Player::White, 24, 11);
+        board.place(Player::White, 13, 2);
+        board.place(Player::White, 2, 1);
+        board.place(Player::Black, 24, 10);
+        board.place(Player::Black, 7, 3);
+        board.off = [1, 2];
+
+        // With dice.
+        let line = format_pos_line(&board, Player::Black, Some([6, 2]));
+        let (b2, t2, d2, f2) = parse_pos_line(&line).expect("parseable");
+        assert_eq!(b2, board);
+        assert_eq!(t2, Player::Black);
+        assert_eq!(d2, Some([6, 2]));
+        assert!(!f2);
+
+        // Without dice (dataset rows) — must still parse, dice = None.
+        let line = format_pos_line(&board, Player::White, None);
+        let (b3, t3, d3, _) = parse_pos_line(&line).expect("dataset rows must be parseable");
+        assert_eq!(b3, board);
+        assert_eq!(t3, Player::White);
+        assert_eq!(d3, None);
+
+        // Garbage without any side token is rejected.
+        assert!(parse_pos_line("dice=3,1 turn=W").is_none());
     }
 
     #[test]

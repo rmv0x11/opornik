@@ -11,14 +11,16 @@ use std::process::ExitCode;
 use engine_core::bearoff::BearoffTable;
 use engine_core::board::Board;
 use engine_core::game::{outcome, Outcome};
-use engine_core::moves::{generate_turns_cfg, Turn};
+use engine_core::moves::generate_turns_cfg;
 use engine_core::net::Net;
 use engine_core::player::Player;
 use engine_core::search::{position_equity, Composite, Heuristic};
 use engine_train::logasai::{self, Decision};
 use engine_train::{
-    benchmark, default_threads, phase_of, rollout_equity, rollout_probs, train_parallel,
-    BenchResult, Phase, Policy, RandomPolicy, Rng, SearchPolicy, TrainConfig,
+    benchmark, best_index, default_threads, format_pos_line, parse_player, parse_pos_line,
+    parse_side, phase_of, rollout_equity, rollout_leaf_value, rollout_probs, sample_decisions,
+    train_parallel, turn_key, BenchResult, Phase, Policy, RandomPolicy, Rng, SearchPolicy,
+    TrainConfig,
 };
 
 fn load_net(path: &str) -> Option<Net> {
@@ -26,20 +28,41 @@ fn load_net(path: &str) -> Option<Net> {
     Net::from_bytes(&bytes)
 }
 
+/// Numeric/parseable flag value. A PRESENT flag with a missing or unparseable
+/// value is a hard error — measurement runs must not silently revert to
+/// defaults because of a typo (`--trials 24O`).
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match args.iter().position(|a| a == flag) {
+        None => default,
+        Some(i) => match args.get(i + 1).and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "bad or missing value for {flag}: {:?}",
+                    args.get(i + 1).map(String::as_str).unwrap_or("<none>")
+                );
+                std::process::exit(2);
+            }
+        },
+    }
 }
 
+/// String flag value. A PRESENT flag followed by nothing or by another flag
+/// is a hard error (`--save --per-phase` must not save to "--per-phase").
 fn str_arg(args: &[String], flag: &str, default: &str) -> String {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| default.to_string())
+    match args.iter().position(|a| a == flag) {
+        None => default.to_string(),
+        Some(i) => match args.get(i + 1) {
+            Some(v) if !v.starts_with("--") => v.clone(),
+            other => {
+                eprintln!(
+                    "bad or missing value for {flag}: {:?}",
+                    other.map(String::as_str).unwrap_or("<none>")
+                );
+                std::process::exit(2);
+            }
+        },
+    }
 }
 
 fn cmd_train(args: &[String]) -> ExitCode {
@@ -157,27 +180,6 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     let r = benchmark(&np, opp.as_ref(), games, 2024);
     report(&format!("net({plies}-ply) vs {vs}"), &r);
     ExitCode::SUCCESS
-}
-
-fn parse_player(s: &str) -> Player {
-    if s.eq_ignore_ascii_case("b") || s.eq_ignore_ascii_case("black") {
-        Player::Black
-    } else {
-        Player::White
-    }
-}
-
-/// Parse "pos:count,pos:count,..." (in the player's own 1..24 path coords).
-fn parse_side(spec: &str, player: Player, board: &mut Board) {
-    for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        if let Some((p, c)) = tok.split_once(':') {
-            if let (Ok(pos), Ok(cnt)) = (p.trim().parse::<u8>(), c.trim().parse::<u8>()) {
-                if (1..=24).contains(&pos) {
-                    board.place(player, pos, cnt);
-                }
-            }
-        }
-    }
 }
 
 /// Relay / analysis: given a position and roll, rank the legal plays by the net's
@@ -299,106 +301,6 @@ fn cmd_endbench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Index of the move maximising the net's equity at the given lookahead
-/// (`extra_plies` beyond the resulting position; 0 = static 1-ply).
-fn best_index(net: &Net, turns: &[Turn], mover: Player, extra_plies: u8) -> usize {
-    let opp = mover.opponent();
-    let mut bi = 0;
-    let mut be = f32::NEG_INFINITY;
-    for (i, t) in turns.iter().enumerate() {
-        let e = -position_equity(net, &t.board, opp, extra_plies, Some(1));
-        if e > be {
-            be = e;
-            bi = i;
-        }
-    }
-    bi
-}
-
-/// Measure the engine's error rate (equity lost per decision) vs deep rollouts —
-/// the standard backgammon strength metric. Lower = stronger; ~0 means the
-/// engine plays at rollout level.
-/// Sample `m` decision positions (>1 legal play) from the net's own 1-ply
-/// greedy self-play — the standard position source for `er`/`diag2`.
-fn sample_decisions(net: &Net, m: usize, seed: u64) -> Vec<(Board, Player, [u8; 2])> {
-    let mut rng = Rng::new(seed);
-    let mut positions: Vec<(Board, Player, [u8; 2])> = Vec::with_capacity(m);
-    'gen: while positions.len() < m {
-        let mut board = Board::starting();
-        let mut mover = Player::White;
-        let mut first = [true, true];
-        for _ in 0..600 {
-            if !matches!(outcome(&board), Outcome::Ongoing) {
-                break;
-            }
-            let dice = rng.dice();
-            let turns = generate_turns_cfg(&board, mover, dice, first[mover.index()], Some(1));
-            first[mover.index()] = false;
-            if turns.len() > 1 {
-                positions.push((board.clone(), mover, dice));
-                if positions.len() >= m {
-                    break 'gen;
-                }
-            }
-            let idx = best_index(net, &turns, mover, 0);
-            board = turns[idx].board.clone();
-            mover = mover.opponent();
-        }
-    }
-    positions
-}
-
-/// Canonical key of a turn: the sorted multiset of its checker moves
-/// (`from>to`, bear-off as `from>0`). Distinct resulting boards always get
-/// distinct keys (transposing orders are already merged by the generator),
-/// unlike the human notation, whose chain-collapse can be ambiguous.
-fn turn_key(t: &Turn) -> String {
-    if t.moves.is_empty() {
-        return "pass".to_string();
-    }
-    let mut segs: Vec<String> = t
-        .moves
-        .iter()
-        .map(|m| format!("{}>{}", m.from, if m.bear_off { 0 } else { m.to }))
-        .collect();
-    segs.sort_unstable();
-    segs.join(",")
-}
-
-/// Inverse of [`parse_pos_line`] (without `first`): one-line position spec.
-fn format_pos_line(board: &Board, turn: Player, dice: Option<[u8; 2]>) -> String {
-    let side = |p: Player| -> String {
-        let mut segs = Vec::new();
-        for pos in (1..=24u8).rev() {
-            let c = board.own_at(p, pos);
-            if c > 0 {
-                segs.push(format!("{pos}:{c}"));
-            }
-        }
-        segs.join(",")
-    };
-    let mut s = format!(
-        "white={} black={} turn={}",
-        side(Player::White),
-        side(Player::Black),
-        if turn == Player::White { "W" } else { "B" }
-    );
-    let (wo, bo) = (
-        board.off[Player::White.index()],
-        board.off[Player::Black.index()],
-    );
-    if wo > 0 {
-        s.push_str(&format!(" white-off={wo}"));
-    }
-    if bo > 0 {
-        s.push_str(&format!(" black-off={bo}"));
-    }
-    if let Some(d) = dice {
-        s.push_str(&format!(" dice={},{}", d[0], d[1]));
-    }
-    s
-}
-
 /// A decision with rollout-labelled equities for every legal turn.
 struct LabeledDecision {
     board: Board,
@@ -461,9 +363,15 @@ fn cmd_er(args: &[String]) -> ExitCode {
     let m = arg(args, "--positions", 300usize);
     let n = arg(args, "--trials", 120usize);
     let seed = arg(args, "--seed", 77u64);
+    let stratify = arg(args, "--stratify", 0usize);
     let save = str_arg(args, "--save", "");
     let load = str_arg(args, "--load", "");
     let per_phase = args.iter().any(|a| a == "--per-phase");
+    println!(
+        "er config: positions {m}, trials {n}, seed {seed}, stratify {stratify}{}{}",
+        if load.is_empty() { String::new() } else { format!(", load {load}") },
+        if save.is_empty() { String::new() } else { format!(", save {save}") },
+    );
 
     let t0 = std::time::Instant::now();
 
@@ -482,7 +390,7 @@ fn cmd_er(args: &[String]) -> ExitCode {
             }
             let mut cols = line.split('\t');
             let Some(spec) = cols.next() else { continue };
-            let Some((board, mover, dice, _)) = parse_pos_line(spec) else {
+            let Some((board, mover, Some(dice), _)) = parse_pos_line(spec) else {
                 eprintln!("er: bad spec line skipped: {spec}");
                 continue;
             };
@@ -501,7 +409,7 @@ fn cmd_er(args: &[String]) -> ExitCode {
     } else {
         println!("Building bear-off table (rollout truncation)...");
         let table = BearoffTable::build();
-        let positions = sample_decisions(&net, m, seed);
+        let positions = sample_decisions(&net, m, seed, 8, stratify);
 
         let threads = default_threads();
         let chunk = positions.len().div_ceil(threads);
@@ -513,11 +421,16 @@ fn cmd_er(args: &[String]) -> ExitCode {
                 .chunks(chunk)
                 .enumerate()
                 .map(|(ci, slice)| {
+                    let offset = ci * chunk;
                     s.spawn(move || {
-                        let mut rng =
-                            Rng::new(seed ^ (0xABCD ^ ci as u64).wrapping_mul(0x9E3779B1));
                         let mut out = Vec::with_capacity(slice.len());
-                        for (board, mover, dice) in slice {
+                        for (j, (board, mover, dice)) in slice.iter().enumerate() {
+                            // Seeded per POSITION, not per chunk: labels must not
+                            // depend on this machine's core count via chunking.
+                            let mut rng = Rng::new(
+                                seed ^ ((offset + j + 1) as u64)
+                                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                            );
                             let opp = mover.opponent();
                             let turns = generate_turns_cfg(board, *mover, *dice, false, Some(1));
                             let eqs = turns
@@ -545,8 +458,22 @@ fn cmd_er(args: &[String]) -> ExitCode {
         });
 
         if !save.is_empty() {
-            let mut text = String::from(
-                "# opornik eval-set: pos-spec \\t turnkey:rollout-equity…  (one decision per line)\n",
+            // Quantize the in-memory labels to exactly what the file stores, so
+            // the ER printed below is reproducible from a later --load.
+            for d in &mut decisions {
+                for (_, e) in &mut d.eqs {
+                    *e = (*e * 10_000.0).round() / 10_000.0;
+                }
+            }
+            let mut text = format!(
+                "# meta: cmd=er net={} positions={} decisions={} trials={} seed={} stratify={}\n\
+                 # opornik eval-set: pos-spec \\t turnkey:rollout-equity…  (one decision per line)\n",
+                str_arg(args, "--in", ""),
+                m,
+                decisions.len(),
+                n,
+                seed,
+                stratify,
             );
             for d in &decisions {
                 text.push_str(&format_pos_line(&d.board, d.mover, Some(d.dice)));
@@ -624,13 +551,44 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
     let trials = arg(args, "--trials", 432usize);
     let seed = arg(args, "--seed", 4242u64);
     let explore = arg(args, "--explore", 0.03f32);
+    let exclude = str_arg(args, "--exclude", "");
+    println!(
+        "dataset config: positions {m}, trials {trials}, seed {seed}, explore {explore}{}",
+        if exclude.is_empty() { String::new() } else { format!(", exclude {exclude}") },
+    );
+
+    // Positions to keep OUT of the training data (the fixed eval-set): the
+    // same net's near-greedy self-play revisits the same openings regardless
+    // of the dice seed, so without an explicit exclusion the regression set
+    // leaks into training.
+    let mut excluded: std::collections::HashSet<(Board, Player)> = Default::default();
+    if !exclude.is_empty() {
+        let Ok(text) = std::fs::read_to_string(&exclude) else {
+            eprintln!("dataset: cannot read --exclude {exclude}");
+            return ExitCode::FAILURE;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let spec = line.split('\t').next().unwrap_or(line);
+            if let Some((board, mover, _, _)) = parse_pos_line(spec) {
+                excluded.insert((board, mover));
+            }
+        }
+        println!("Excluding {} eval-set positions from the dataset", excluded.len());
+    }
 
     let t0 = std::time::Instant::now();
     println!("Building bear-off table (rollout truncation)...");
     let table = BearoffTable::build();
 
     // Collect unique to-roll states from self-play (greedy + explore noise) —
-    // the same distribution the net sees as search leaves.
+    // the same distribution the net sees as search leaves. States where the
+    // to-roll player still holds first-turn rights are skipped: rollout labels
+    // are computed with `first=false`, and the head-doubles exception would
+    // make such labels mismatch the position actually faced.
     let mut rng = Rng::new(seed);
     let mut seen: std::collections::HashSet<(Board, Player)> = std::collections::HashSet::new();
     let mut states: Vec<(Board, Player)> = Vec::with_capacity(m);
@@ -653,6 +611,8 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
             board = turns[idx].board.clone();
             mover = mover.opponent();
             if matches!(outcome(&board), Outcome::Ongoing)
+                && !first[mover.index()]
+                && !excluded.contains(&(board.clone(), mover))
                 && seen.insert((board.clone(), mover))
             {
                 states.push((board.clone(), mover));
@@ -682,10 +642,15 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
             .chunks(chunk)
             .enumerate()
             .map(|(ci, slice)| {
+                let offset = ci * chunk;
                 s.spawn(move || {
-                    let mut rng = Rng::new(seed ^ (0x5EED ^ ci as u64).wrapping_mul(0x9E3779B1));
                     let mut out = Vec::with_capacity(slice.len());
-                    for (board, to_roll) in slice {
+                    for (j, (board, to_roll)) in slice.iter().enumerate() {
+                        // per-position seed: labels independent of core count
+                        let mut rng = Rng::new(
+                            seed ^ ((offset + j + 1) as u64)
+                                .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        );
                         let p = rollout_probs(net_ref, table, board, *to_roll, trials, &mut rng);
                         let phase = phase_of(board, *to_roll);
                         out.push((
@@ -714,7 +679,16 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
         }
     });
 
-    let header = "# opornik dataset: pos-spec \\t phase \\t p_win_oin \\t p_win_mars \\t p_lose_oin \\t p_lose_mars \\t trials\n";
+    let header = format!(
+        "# meta: cmd=dataset net={} positions={} trials={} seed={} explore={} exclude={}\n\
+         # opornik dataset: pos-spec \\t phase \\t p_win_oin \\t p_win_mars \\t p_lose_oin \\t p_lose_mars \\t trials\n",
+        str_arg(args, "--net", ""),
+        rows.len(),
+        trials,
+        seed,
+        explore,
+        if exclude.is_empty() { "-" } else { &exclude },
+    );
     let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
     if let Err(e) = std::fs::write(&out, format!("{header}{body}")) {
         eprintln!("dataset: failed to write {out}: {e}");
@@ -736,10 +710,15 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
 
 /// Diagnostic for the 2-ply null result: does 2-ply help once the LEAVES are
 /// scored by rollouts instead of the net? Compares the ER (vs high-trial
-/// rollout truth) of three choosers: net 1-ply, net 2-ply, and 2-ply with
-/// rollout-evaluated leaves. If the third is much better than the second, the
-/// net's leaf errors are systematic (encoding/training problem) — averaging
-/// over the 21 rolls cannot cancel them.
+/// rollout truth) of four choosers: net 1-ply, net 2-ply, 2-ply with
+/// rollout-evaluated leaves, and a NOISE-FLOOR chooser that picks by an
+/// independent same-budget re-rollout of the truth. The floor calibrates how
+/// much regret pure rollout noise produces under this exact protocol — every
+/// regret is charged against noisy truth, and noise-driven choosers pay a
+/// winner's-curse tax the deterministic net choosers don't. The verdict
+/// therefore compares EXCESS over the floor: if rollout leaves recover most of
+/// the net-2-ply excess, the net's leaf errors are systematic
+/// (encoding/training problem) — averaging over 21 rolls cannot cancel them.
 fn cmd_diag2(args: &[String]) -> ExitCode {
     let net = match load_net(&str_arg(args, "--net", "")) {
         Some(n) => n,
@@ -752,28 +731,35 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
     let truth_trials = arg(args, "--trials", 96usize);
     let leaf_trials = arg(args, "--leaf-trials", 24usize);
     let seed = arg(args, "--seed", 99u64);
+    println!("diag2 config: positions {m}, truth-trials {truth_trials}, leaf-trials {leaf_trials}, seed {seed}");
 
     let t0 = std::time::Instant::now();
     println!("Building bear-off table (rollout truncation)...");
     let table = BearoffTable::build();
-    let positions = sample_decisions(&net, m, seed);
+    let positions = sample_decisions(&net, m, seed, 8, 0);
 
     let threads = default_threads();
     let chunk = positions.len().div_ceil(threads);
     let net_ref = &net;
     let table = &table;
-    // (er1, er2, er_rollout_leaf, a1, a2, a_rl, cnt)
-    let mut partials: Vec<(f64, f64, f64, usize, usize, usize, usize)> = Vec::new();
+    // per-thread partials: ([er1, er2, er_leaf, er_floor], [a1, a2, a_leaf, a_floor], cnt)
+    let mut partials: Vec<([f64; 4], [usize; 4], usize)> = Vec::new();
     std::thread::scope(|s| {
         let handles: Vec<_> = positions
             .chunks(chunk)
             .enumerate()
             .map(|(ci, slice)| {
+                let offset = ci * chunk;
                 s.spawn(move || {
-                    let mut rng = Rng::new(seed ^ (0xD1A6 ^ ci as u64).wrapping_mul(0x9E3779B1));
-                    let (mut er1, mut er2, mut erl) = (0.0f64, 0.0f64, 0.0f64);
-                    let (mut a1, mut a2, mut al, mut cnt) = (0usize, 0usize, 0usize, 0usize);
-                    for (board, mover, dice) in slice {
+                    let mut ers = [0.0f64; 4];
+                    let mut agrees = [0usize; 4];
+                    let mut cnt = 0usize;
+                    for (j, (board, mover, dice)) in slice.iter().enumerate() {
+                        // per-position seed: results independent of core count
+                        let mut rng = Rng::new(
+                            seed ^ ((offset + j + 1) as u64)
+                                .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        );
                         let opp = mover.opponent();
                         let turns = generate_turns_cfg(board, *mover, *dice, false, Some(1));
 
@@ -789,37 +775,31 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
                             |(bi, be), (i, &e)| if e > be { (i, e) } else { (bi, be) },
                         );
 
-                        // Chooser 3: 2-ply with rollout leaves — average over the
-                        // 21 opponent rolls of the rollout value of the opponent's
-                        // (net-greedy) best reply.
+                        // Noise floor: an independent re-rollout of the same
+                        // budget picks its own argmax; its regret vs truth is
+                        // what rollout noise alone costs under this protocol.
+                        let floor_idx = turns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                (i, -rollout_equity(net_ref, table, &t.board, opp, truth_trials, &mut rng).0)
+                            })
+                            .fold((0usize, f32::NEG_INFINITY), |(bi, be), (i, e)| {
+                                if e > be { (i, e) } else { (bi, be) }
+                            })
+                            .0;
+
+                        // Chooser 3: 2-ply with rollout leaves (terminal-safe).
                         let mut best_rl = (0usize, f32::NEG_INFINITY);
                         for (i, t) in turns.iter().enumerate() {
-                            let mut val = 0.0f32;
-                            for d1 in 1..=6u8 {
-                                for d2 in d1..=6u8 {
-                                    let w = if d1 == d2 { 1.0 } else { 2.0 };
-                                    let replies = generate_turns_cfg(
-                                        &t.board,
-                                        opp,
-                                        [d1, d2],
-                                        false,
-                                        Some(1),
-                                    );
-                                    let ri = best_index(net_ref, &replies, opp, 0);
-                                    let leaf = &replies[ri].board;
-                                    let leaf_eq = rollout_equity(
-                                        net_ref,
-                                        table,
-                                        leaf,
-                                        *mover,
-                                        leaf_trials,
-                                        &mut rng,
-                                    )
-                                    .0;
-                                    val += w * leaf_eq;
-                                }
-                            }
-                            let val = val / 36.0;
+                            let val = rollout_leaf_value(
+                                net_ref,
+                                table,
+                                &t.board,
+                                *mover,
+                                leaf_trials,
+                                &mut rng,
+                            );
                             if val > best_rl.1 {
                                 best_rl = (i, val);
                             }
@@ -827,15 +807,13 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
 
                         let i1 = best_index(net_ref, &turns, *mover, 0);
                         let i2 = best_index(net_ref, &turns, *mover, 1);
-                        er1 += f64::from((best - eqs[i1]).max(0.0));
-                        er2 += f64::from((best - eqs[i2]).max(0.0));
-                        erl += f64::from((best - eqs[best_rl.0]).max(0.0));
-                        a1 += usize::from(i1 == best_idx);
-                        a2 += usize::from(i2 == best_idx);
-                        al += usize::from(best_rl.0 == best_idx);
+                        for (slot, idx) in [i1, i2, best_rl.0, floor_idx].into_iter().enumerate() {
+                            ers[slot] += f64::from((best - eqs[idx]).max(0.0));
+                            agrees[slot] += usize::from(idx == best_idx);
+                        }
                         cnt += 1;
                     }
-                    (er1, er2, erl, a1, a2, al, cnt)
+                    (ers, agrees, cnt)
                 })
             })
             .collect();
@@ -844,55 +822,43 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
         }
     });
 
-    let (er1, er2, erl, a1, a2, al, cnt) = partials.into_iter().fold(
-        (0.0, 0.0, 0.0, 0, 0, 0, 0),
-        |acc, p| (acc.0 + p.0, acc.1 + p.1, acc.2 + p.2, acc.3 + p.3, acc.4 + p.4, acc.5 + p.5, acc.6 + p.6),
+    let (ers, agrees, cnt) = partials.into_iter().fold(
+        ([0.0f64; 4], [0usize; 4], 0usize),
+        |(mut e, mut a, c), p| {
+            for k in 0..4 {
+                e[k] += p.0[k];
+                a[k] += p.1[k];
+            }
+            (e, a, c + p.2)
+        },
     );
     let c = cnt.max(1) as f64;
+    let [er1, er2, erl, erf] = ers.map(|e| e / c);
+    let pct = |a: usize| 100.0 * a as f64 / c;
     println!(
         "\n2-ply leaf diagnostic ({cnt} decisions, truth {truth_trials} trials, leaves {leaf_trials} trials, {:.0}s):",
         t0.elapsed().as_secs_f32()
     );
-    println!("  net 1-ply:           ER {:.4}  agree {:.1}%", er1 / c, 100.0 * a1 as f64 / c);
-    println!("  net 2-ply:           ER {:.4}  agree {:.1}%", er2 / c, 100.0 * a2 as f64 / c);
-    println!("  2-ply rollout-leaf:  ER {:.4}  agree {:.1}%", erl / c, 100.0 * al as f64 / c);
+    println!("  net 1-ply:           ER {er1:.4}  agree {:.1}%", pct(agrees[0]));
+    println!("  net 2-ply:           ER {er2:.4}  agree {:.1}%", pct(agrees[1]));
+    println!("  2-ply rollout-leaf:  ER {erl:.4}  agree {:.1}%", pct(agrees[2]));
+    println!("  noise floor:         ER {erf:.4}  agree {:.1}%   (same-budget re-rollout argmax)", pct(agrees[3]));
+    let ex2 = er2 - erf;
+    let exl = erl - erf;
+    println!(
+        "  excess over floor:   net 2-ply {ex2:+.4}   rollout-leaf {exl:+.4}"
+    );
     println!(
         "  → verdict: {}",
-        if erl < er2 * 0.6 {
-            "rollout leaves fix 2-ply → the net's leaf errors are SYSTEMATIC (encoding/training limit)"
+        if ex2 <= 0.005 {
+            "net 2-ply is already within noise of the rollout floor — diagnostic inconclusive at this budget (raise --trials)"
+        } else if exl < 0.4 * ex2 {
+            "rollout leaves recover most of the 2-ply excess → the net's leaf errors are SYSTEMATIC (encoding/training limit)"
         } else {
             "rollout leaves do not fix 2-ply → leaf accuracy is not the binding constraint"
         }
     );
     ExitCode::SUCCESS
-}
-
-/// Parse a one-line position spec used by `relay`/`agree`:
-///   `white=24:13,18:2 black=24:15 turn=W dice=3,1 [white-off=N] [black-off=N] [first]`
-fn parse_pos_line(spec: &str) -> Option<(Board, Player, [u8; 2], bool)> {
-    let mut board = Board::empty();
-    let mut turn = Player::White;
-    let mut dice: Option<[u8; 2]> = None;
-    let mut first = false;
-    for tok in spec.split_whitespace() {
-        let (k, v) = tok.split_once('=').unwrap_or((tok, ""));
-        match k {
-            "white" => parse_side(v, Player::White, &mut board),
-            "black" => parse_side(v, Player::Black, &mut board),
-            "white-off" => board.off[Player::White.index()] = v.parse().unwrap_or(0),
-            "black-off" => board.off[Player::Black.index()] = v.parse().unwrap_or(0),
-            "turn" => turn = parse_player(v),
-            "dice" => {
-                let d: Vec<u8> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                if d.len() == 2 {
-                    dice = Some([d[0], d[1]]);
-                }
-            }
-            "first" => first = v.is_empty() || v.eq_ignore_ascii_case("true") || v == "1",
-            _ => {}
-        }
-    }
-    Some((board, turn, dice?, first))
 }
 
 /// Relay: read position+roll lines from stdin and print the engine's best plays.
@@ -914,8 +880,8 @@ fn cmd_relay(args: &[String]) -> ExitCode {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((board, mover, dice, first)) = parse_pos_line(&line) else {
-            eprintln!("  ? unparseable line (need at least dice=d1,d2)");
+        let Some((board, mover, Some(dice), first)) = parse_pos_line(&line) else {
+            eprintln!("  ? unparseable line (need white=/black= and dice=d1,d2)");
             continue;
         };
         if !board.is_valid() {
@@ -977,7 +943,7 @@ fn cmd_agree(args: &[String]) -> ExitCode {
                         eprintln!("  ? line without `play=`: {line}");
                         continue;
                     };
-                    if let Some((board, mover, dice, first)) = parse_pos_line(prefix) {
+                    if let Some((board, mover, Some(dice), first)) = parse_pos_line(prefix) {
                         decisions.push(Decision {
                             board,
                             mover,
@@ -1071,7 +1037,7 @@ fn main() -> ExitCode {
         Some("agree") => cmd_agree(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E]   (rollout-labelled training data)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
+                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--stratify K] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E] [--exclude EVALSET]   (rollout-labelled training data)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
             );
             ExitCode::FAILURE
         }

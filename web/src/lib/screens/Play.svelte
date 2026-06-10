@@ -1380,7 +1380,8 @@
           <span class="label">вы {(displayWin * 100).toFixed(0)}%</span>
         </div>
       {:else}
-        <span class="label muted">шкала шансов скрыта · вы {(displayWin * 100).toFixed(0)}%</span>
+        <!-- hidden means hidden: no win number may leak into the collapsed label -->
+        <span class="label muted">шкала шансов скрыта</span>
       {/if}
       <button
         type="button"

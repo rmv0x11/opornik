@@ -159,8 +159,11 @@ impl NetV2 {
         if dims.windows(2).any(|d| d[0].1 != d[1].0) {
             return None;
         }
-        let total: usize = dims.iter().map(|&(i, o)| i * o + o).sum();
-        if bytes.len() != off + total * 4 {
+        // u64 arithmetic: 64 layers × 4096² floats × 4 bytes overflows usize
+        // on wasm32, where this loader also runs — a crafted header must be
+        // rejected, not wrap into a "valid" length and trap later.
+        let total: u64 = dims.iter().map(|&(i, o)| (i as u64) * (o as u64) + o as u64).sum();
+        if bytes.len() as u64 != off as u64 + total * 4 {
             return None;
         }
         let mut layers = Vec::with_capacity(n);

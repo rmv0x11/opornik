@@ -117,19 +117,34 @@ fn trapped_behind(board: &Board, player: Player, hi: u8) -> (u8, f32) {
 /// The 9 per-side expert features, written into `out[0..9]`.
 fn side_features(board: &Board, side: Player, out: &mut [f32]) {
     let (block_len, block_hi) = max_block(board, side);
-    let (trapped, depth) = trapped_behind(board, side, block_hi);
+    // A lone occupied cell is easily passed — block-derived features (front
+    // edge, trapped count/depth) only fire for genuine runs of 2+.
+    let (trapped, depth) = if block_len >= 2 {
+        trapped_behind(board, side, block_hi)
+    } else {
+        (0, 0.0)
+    };
 
-    // Spares: checkers neither on the head nor part of the strongest block.
+    // Spares: checkers neither on the head nor part of the strongest block —
+    // the UNION of the two sets: the head cell (own pos 24 = enemy frame 12)
+    // is mid-path for the enemy and regularly sits INSIDE the strongest run
+    // (chaining with own 23 = f11 and own 1 = f13), so subtracting `on_head`
+    // and the block sum separately would count the head stack twice.
     // Block cells in MY frame: enemy-frame f maps back to my pos (f+12) mod 24.
     let mut in_block = 0u8;
+    let mut head_in_block = false;
     if block_len >= 2 {
         for f in (block_hi + 1 - block_len)..=block_hi {
             let my_pos = (f + 12 - 1) % 24 + 1;
+            if my_pos == HEAD_POS {
+                head_in_block = true;
+            }
             in_block += board.own_at(side, my_pos);
         }
     }
     let on_head = board.own_at(side, HEAD_POS);
     let on_board = board.checkers_on_board(side);
+    let excluded = in_block + if head_in_block { 0 } else { on_head };
 
     let mut stacked = 0u8;
     let mut home_points = 0u8;
@@ -148,23 +163,26 @@ fn side_features(board: &Board, side: Player, out: &mut [f32]) {
     out[0] = (block_len.min(6)) as f32 / 6.0;
     out[1] = if block_len >= 2 { block_hi as f32 / 24.0 } else { 0.0 };
     out[2] = trapped as f32 / N_CHECKERS as f32;
-    out[3] = depth / 18.0;
+    // hi >= 2 for any 2+ run, so depth <= 22 and the feature stays in [0, 1].
+    out[3] = depth / 23.0;
     out[4] = on_head as f32 / N_CHECKERS as f32;
-    out[5] = on_board.saturating_sub(on_head).saturating_sub(in_block) as f32 / N_CHECKERS as f32;
+    out[5] = on_board.saturating_sub(excluded) as f32 / N_CHECKERS as f32;
     out[6] = stacked as f32 / 6.0;
     out[7] = home_points as f32 / HOME_HIGH as f32;
     out[8] = in_home as f32 / N_CHECKERS as f32;
 }
 
-/// Timing: pips of `side`'s checkers OUTSIDE its strongest block — how long the
-/// side can keep moving without being forced to break the block.
+/// Timing: pips of `side`'s checkers not committed to holding its strongest
+/// block — how long the side can keep moving without being forced to break it.
+/// Only ONE checker per block cell is committed; extra checkers stacked on a
+/// block point move freely, so their pips still count as timing.
 fn free_pips(board: &Board, side: Player) -> f32 {
     let (block_len, block_hi) = max_block(board, side);
     let mut pips = board.pip(side) as i32;
     if block_len >= 2 {
         for f in (block_hi + 1 - block_len)..=block_hi {
             let my_pos = (f + 12 - 1) % 24 + 1;
-            pips -= my_pos as i32 * board.own_at(side, my_pos) as i32;
+            pips -= my_pos as i32; // one holder per cell (block cells hold >= 1)
         }
     }
     pips.max(0) as f32 / START_PIP as f32
@@ -231,35 +249,103 @@ mod tests {
 
     #[test]
     fn block_and_trapped_geometry() {
-        // White holds own path positions 7..=12 — a 6-prime. In Black's frame
-        // those cells are positions (7+12)..(12+12) = 19..=24: hi = 24, len 6.
+        // White 6-prime on own 1..=6 → Black-frame 13..=18 (hi 18, len 6);
+        // 3 spare White checkers on own 10 (Black frame 22, a separate run).
+        // Black: 10 still on the head (own 24, phys 12 — free) and 5 on own 20
+        // (phys 16 — free; White home cells are phys 18..23). All 15+15 on
+        // board, no cell shared — the fixture must keep the prime intact.
         let mut b = Board::empty();
-        for pos in 7..=12u8 {
+        for pos in 1..=6u8 {
             b.place(Player::White, pos, 2);
         }
-        b.place(Player::White, 24, 3);
+        b.place(Player::White, 10, 3);
+        b.place(Player::Black, 24, 10);
+        b.place(Player::Black, 20, 5);
+        assert!(b.is_valid(), "fixture must be a legal 15+15 position");
+
         let (len, hi) = max_block(&b, Player::White);
-        assert_eq!((len, hi), (6, 24));
+        assert_eq!((len, hi), (6, 18));
+        // Every Black checker stands at Black-frame positions > 18 → trapped.
+        let (trapped, depth) = trapped_behind(&b, Player::White, hi);
+        assert_eq!(trapped, 15);
+        // depth = (5×(20−18) + 10×(24−18)) / 15
+        assert!((depth - 70.0 / 15.0).abs() < 1e-6);
 
-        // A Black checker on its own position 24 (the head) is behind that
-        // block (24 <= hi means NOT strictly behind — place deeper instead).
-        // Black at own position 23..: nothing > hi=24 exists, so trapped = 0.
-        b.place(Player::Black, 23, 5);
-        let (trapped, _) = trapped_behind(&b, Player::White, hi);
-        assert_eq!(trapped, 0);
+        // Black's own strongest block (head cell, length 1) traps nothing —
+        // block-derived features need a run of 2+.
+        let (blen, _) = max_block(&b, Player::Black);
+        assert_eq!(blen, 1);
+    }
 
-        // Now a block further forward: White on own 1..=4 → Black frame
-        // 13..=16: hi = 16. Black checkers at own 23 (5 of them) are behind it.
-        let mut b2 = Board::empty();
-        for pos in 1..=4u8 {
-            b2.place(Player::White, pos, 2);
-        }
-        b2.place(Player::Black, 23, 5);
-        let (len2, hi2) = max_block(&b2, Player::White);
-        assert_eq!((len2, hi2), (4, 16));
-        let (trapped2, depth2) = trapped_behind(&b2, Player::White, hi2);
-        assert_eq!(trapped2, 5);
-        assert_eq!(depth2, 7.0); // 23 - 16
+    #[test]
+    fn spares_exclude_head_and_block_without_double_counting() {
+        // White: 5 on the head (own 24 = enemy frame 12), 2 on own 1 (frame
+        // 13) — together the strongest block (len 2, hi 13) CONTAINING the
+        // head — plus 8 on own 18: the true spares. The buggy formula
+        // on_board − on_head − in_block subtracted the head stack twice and
+        // reported 3.
+        let mut b = Board::empty();
+        b.place(Player::White, 24, 5);
+        b.place(Player::White, 1, 2);
+        b.place(Player::White, 18, 8);
+        b.place(Player::Black, 24, 15);
+        assert!(b.is_valid());
+        let (len, hi) = max_block(&b, Player::White);
+        assert_eq!((len, hi), (2, 13));
+
+        let mut f = [0.0f32; 9];
+        side_features(&b, Player::White, &mut f);
+        assert_eq!(f[5] * 15.0, 8.0, "spares must not double-subtract the head stack");
+
+        // Control: head NOT in the block — both exclusions apply separately.
+        let mut c = Board::empty();
+        c.place(Player::White, 24, 5); // head alone (frame 12; neighbours empty)
+        c.place(Player::White, 5, 2); // frame 17
+        c.place(Player::White, 6, 2); // frame 18 → block (2, 18)
+        c.place(Player::White, 18, 6); // spares
+        c.place(Player::Black, 24, 15);
+        assert!(c.is_valid());
+        let mut g = [0.0f32; 9];
+        side_features(&c, Player::White, &mut g);
+        assert_eq!(g[5] * 15.0, 6.0);
+    }
+
+    #[test]
+    fn lone_cell_gates_block_features_and_depth_stays_normalized() {
+        // A lone occupied cell (len-1 run) must not report front edge,
+        // trapped or depth.
+        let mut b = Board::empty();
+        b.place(Player::White, 13, 15); // enemy frame 1, a length-1 run
+        b.place(Player::Black, 24, 15);
+        let mut f = [0.0f32; 9];
+        side_features(&b, Player::White, &mut f);
+        assert_eq!((f[1], f[2], f[3]), (0.0, 0.0, 0.0));
+
+        // Deepest possible trap under the len>=2 gate: block at enemy frame
+        // 1..2 (own 13..14), enemy on their head (depth 22) → feature < 1.
+        let mut d = Board::empty();
+        d.place(Player::White, 13, 2);
+        d.place(Player::White, 14, 2);
+        d.place(Player::White, 20, 11);
+        d.place(Player::Black, 24, 15);
+        assert!(d.is_valid());
+        let mut g = [0.0f32; 9];
+        side_features(&d, Player::White, &mut g);
+        assert!(g[3] > 0.9 && g[3] <= 1.0, "depth must stay in [0,1], got {}", g[3]);
+    }
+
+    #[test]
+    fn free_pips_commits_one_checker_per_block_cell() {
+        // Head (5 checkers) + own 1 form the block; only ONE checker per cell
+        // is committed, so timing = total pips − (24 + 1).
+        let mut b = Board::empty();
+        b.place(Player::White, 24, 5);
+        b.place(Player::White, 1, 2);
+        b.place(Player::White, 18, 8);
+        b.place(Player::Black, 24, 15);
+        let total = (24 * 5 + 2 + 18 * 8) as f32;
+        let got = free_pips(&b, Player::White) * START_PIP as f32;
+        assert!((got - (total - 25.0)).abs() < 1e-3, "got {got}");
     }
 
     #[test]

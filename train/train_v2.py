@@ -92,10 +92,18 @@ def bytes_to_state(blob: bytes, model: nn.Sequential) -> None:
 
 def train_one(name, feats, targets, hidden, args, device, init_blob=None):
     n, dim = feats.shape
+    if n == 0:
+        sys.exit(
+            f"{name}: 0 rows — the NNF2 file is empty (small datasets may have "
+            "no race rows; generate more positions)"
+        )
     gen = torch.Generator().manual_seed(args.seed)
     perm = torch.randperm(n, generator=gen)
-    n_val = max(1, int(n * args.val)) if n > 10 else 0
+    # --val 0 disables validation (and best-val snapshotting) entirely.
+    n_val = int(n * args.val) if n > 10 else 0
     val_idx, train_idx = perm[:n_val], perm[n_val:]
+    if len(train_idx) == 0:
+        sys.exit(f"{name}: --val {args.val} leaves an empty training set (n={n})")
 
     x = torch.from_numpy(feats)
     y = torch.from_numpy(targets)
@@ -178,6 +186,11 @@ def main():
     rx, ry = load_nnf2(args.race)
     print(f"contact: {cx.shape[0]} rows × {cx.shape[1]} features")
     print(f"race:    {rx.shape[0]} rows × {rx.shape[1]} features")
+    # Fail BEFORE spending minutes training the first net if the second file
+    # is empty (small datasets often produce zero race rows).
+    for name, arr in (("contact", cx), ("race", rx)):
+        if arr.shape[0] == 0:
+            sys.exit(f"{name}: 0 rows in the NNF2 file — generate more positions")
 
     contact = train_one("contact", cx, cy, hidden, args, device, init_contact)
     race = train_one("race", rx, ry, hidden, args, device, init_race)

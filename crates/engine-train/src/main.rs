@@ -28,6 +28,39 @@ fn load_net(path: &str) -> Option<Net> {
     Net::from_bytes(&bytes)
 }
 
+/// Either net generation, behind one [`Evaluator`] — duels and label-scoring
+/// work across formats (v1 `Net` vs v2 `PhaseNets`).
+enum AnyEval {
+    V1(Net),
+    V2(engine_core::PhaseNets),
+}
+
+impl engine_core::search::Evaluator for AnyEval {
+    fn equity(&self, board: &Board, mover: Player) -> f32 {
+        match self {
+            AnyEval::V1(n) => engine_core::search::Evaluator::equity(n, board, mover),
+            AnyEval::V2(p) => engine_core::search::Evaluator::equity(p, board, mover),
+        }
+    }
+}
+
+/// Load a net of either format, sniffing the `NV2P` magic.
+fn load_eval(path: &str) -> Option<AnyEval> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.starts_with(b"NV2P") {
+        engine_core::PhaseNets::from_bytes(&bytes).map(AnyEval::V2)
+    } else {
+        Net::from_bytes(&bytes).map(AnyEval::V1)
+    }
+}
+
+fn eval_kind(e: &AnyEval) -> &'static str {
+    match e {
+        AnyEval::V1(_) => "v1",
+        AnyEval::V2(_) => "v2",
+    }
+}
+
 /// Numeric/parseable flag value. A PRESENT flag with a missing or unparseable
 /// value is a hard error — measurement runs must not silently revert to
 /// defaults because of a typo (`--trials 24O`).
@@ -136,17 +169,22 @@ fn cmd_duel(args: &[String]) -> ExitCode {
     let pb = str_arg(args, "--b", "");
     let games = arg(args, "--games", 200);
     let plies = arg(args, "--plies", 1u8);
-    let (na, nb) = match (load_net(&pa), load_net(&pb)) {
+    let (na, nb) = match (load_eval(&pa), load_eval(&pb)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
             eprintln!("Failed to load nets: --a {pa} --b {pb}");
             return ExitCode::FAILURE;
         }
     };
+    let label = format!(
+        "A({pa} [{}]) vs B({pb} [{}]) @ {plies}-ply",
+        eval_kind(&na),
+        eval_kind(&nb)
+    );
     let a = SearchPolicy { eval: na, plies };
     let b = SearchPolicy { eval: nb, plies };
     let r = benchmark(&a, &b, games, 555);
-    report(&format!("A({pa}) vs B({pb}) @ {plies}-ply"), &r);
+    report(&label, &r);
     ExitCode::SUCCESS
 }
 
@@ -310,11 +348,11 @@ struct LabeledDecision {
     eqs: Vec<(String, f32)>,
 }
 
-/// Score a net's 1-ply and 2-ply choices against labelled decisions.
+/// Score an evaluator's 1-ply and 2-ply choices against labelled decisions.
 /// Returns per-phase accumulators keyed by `Phase`.
 #[allow(clippy::type_complexity)]
-fn score_against_labels(
-    net: &Net,
+fn score_against_labels<E: engine_core::search::Evaluator>(
+    net: &E,
     decisions: &[LabeledDecision],
 ) -> (Vec<(Phase, f64, f64, usize, usize, usize)>, usize) {
     use std::collections::HashMap;
@@ -353,10 +391,13 @@ fn score_against_labels(
 }
 
 fn cmd_er(args: &[String]) -> ExitCode {
-    let net = match load_net(&str_arg(args, "--in", "")) {
-        Some(n) => n,
+    // --load scores ANY evaluator (v1 net or v2 pair) against the saved
+    // labels; fresh generation additionally needs a v1 net, whose 1-ply
+    // policy drives sampling and rollouts.
+    let eval = match load_eval(&str_arg(args, "--in", "")) {
+        Some(e) => e,
         None => {
-            eprintln!("er: need a valid --in PATH");
+            eprintln!("er: need a valid --in PATH (v1 net or NV2P pair)");
             return ExitCode::FAILURE;
         }
     };
@@ -407,13 +448,20 @@ fn cmd_er(args: &[String]) -> ExitCode {
         println!("Loaded {} labelled decisions from {load}", out.len());
         out
     } else {
+        let AnyEval::V1(ref net) = eval else {
+            eprintln!(
+                "er: generating fresh labels requires a v1 net (its 1-ply policy \
+                 drives sampling and rollouts); score v2 pairs via --load"
+            );
+            return ExitCode::FAILURE;
+        };
         println!("Building bear-off table (rollout truncation)...");
         let table = BearoffTable::build();
-        let positions = sample_decisions(&net, m, seed, 8, stratify);
+        let positions = sample_decisions(net, m, seed, 8, stratify);
 
         let threads = default_threads();
         let chunk = positions.len().div_ceil(threads);
-        let net_ref = &net;
+        let net_ref: &Net = net;
         let table = &table;
         let mut decisions: Vec<LabeledDecision> = Vec::with_capacity(positions.len());
         std::thread::scope(|s| {
@@ -492,7 +540,7 @@ fn cmd_er(args: &[String]) -> ExitCode {
     };
 
     // Score the net against the labels (cheap, net-only).
-    let (rows, skipped) = score_against_labels(&net, &decisions);
+    let (rows, skipped) = score_against_labels(&eval, &decisions);
     let (mut er1, mut er2, mut a1, mut a2, mut cnt) = (0.0f64, 0.0f64, 0usize, 0usize, 0usize);
     for &(_, e1, e2, x1, x2, c) in &rows {
         er1 += e1;

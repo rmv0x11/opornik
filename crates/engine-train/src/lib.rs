@@ -495,14 +495,14 @@ pub fn probs4_equity(p: [f32; 4]) -> f32 {
 
 // ---- Measurement tooling (shared by er / diag2 / dataset) -------------------
 
-/// Index of the turn maximising the net's equity at the given lookahead
+/// Index of the turn maximising the evaluator's equity at the given lookahead
 /// (`extra_plies` beyond the resulting position; 0 = static 1-ply).
-pub fn best_index(net: &Net, turns: &[Turn], mover: Player, extra_plies: u8) -> usize {
+pub fn best_index<E: Evaluator>(eval: &E, turns: &[Turn], mover: Player, extra_plies: u8) -> usize {
     let opp = mover.opponent();
     let mut bi = 0;
     let mut be = f32::NEG_INFINITY;
     for (i, t) in turns.iter().enumerate() {
-        let e = -position_equity(net, &t.board, opp, extra_plies, HEAD_LIMIT);
+        let e = -position_equity(eval, &t.board, opp, extra_plies, HEAD_LIMIT);
         if e > be {
             be = e;
             bi = i;

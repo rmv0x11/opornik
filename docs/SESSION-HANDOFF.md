@@ -1,5 +1,12 @@
 # Session handoff — opornik (читать первым после очистки контекста)
 
+## ⏸ ПАУЗА 2026-06-10 — ЭТАП 0 ДВИЖКА V2 (продолжить отсюда)
+Пользователь сказал «поехали» по `docs/engine-v2-plan.md` (читать его первым). Этап 0 (тулинг) РЕАЛИЗОВАН и закоммичен (`41e0fbc`): `engine-train dataset` (роллаут-метки TSV), `er --per-phase --save/--load` (фиксированный eval-set, round-trip точный), `diag2` (диагностика «2-ply с роллаут-листьями»), Wilson CI + p-value в duel/bench, фазовый классификатор `phase_of`. 10/10 тестов, смоук пройден.
+**На момент паузы в фоне крутились (проверить результаты!):**
+1. `/tmp/opornik-stage0.log` — diag2 (60 решений, truth 96, leaf 24) + затем генерация `data/evalset-v1.tsv` (200×120). Если лог оборван/процесса нет — перезапустить: `./target/release/engine-train diag2 --net models/nardy-net.bin --positions 60 --trials 96 --leaf-trials 24 --seed 99` и `./target/release/engine-train er --in models/nardy-net.bin --positions 200 --trials 120 --seed 77 --per-phase --save data/evalset-v1.tsv` (суммарно ~45 мин). `data/evalset-v1.tsv` потом закоммитить.
+2. Adversarial-ревью кода этапа 0 НЕ завершилось (workflow погиб с сессией) — код НЕ ревьюён; перед доверием числам diag2/eval-set прогнать ревью заново (фокус: перспективы/знаки в `rollout_probs` и diag2-листьях, round-trip `format_pos_line`↔`parse_pos_line`, `turn_key`, ci95/p-value).
+**Дальше по плану:** интерпретировать diag2 (роллаут-листья чинят 2-ply ⇒ ошибка сети систематическая ⇒ рецепт подтверждён) → вписать в `docs/training-log.md` → этап 1 плана (кодировка v2: фичи прайма/тайминга, contact/race split, 4-softmax, multi-layer net.rs + экспорт из PyTorch). Замеренный темп: ~3 ч на 10k позиций × 432 роллаута (датасет этапа 2 = ночной прогон).
+
 Живой сайт: https://rmv0x11.github.io/opornik/ · деплой автоматический (правило `auto-deploy-no-ask`).
 Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.20** (`index-BFDk_k-8.js`, gh-pages коммит `972dc87`; live-тесты 2/2 зелёные).
 

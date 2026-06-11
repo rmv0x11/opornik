@@ -44,3 +44,4 @@ data/gen*.tsv
 data/*-contact.bin
 data/*-race.bin
 data/distill*
+!/models/nardy-v2-champion.bin

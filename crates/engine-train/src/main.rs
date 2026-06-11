@@ -473,7 +473,7 @@ fn cmd_er(args: &[String]) -> ExitCode {
         let table = BearoffTable::build();
         let positions = sample_decisions(&eval, m, seed, 8, stratify);
 
-        let threads = default_threads();
+        let threads = arg(args, "--threads", default_threads()).max(1);
         let chunk = positions.len().div_ceil(threads);
         let net_ref = &eval;
         let table = &table;
@@ -708,7 +708,7 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
     );
 
     // Label in parallel.
-    let threads = default_threads();
+    let threads = arg(args, "--threads", default_threads()).max(1);
     let chunk = states.len().div_ceil(threads);
     let net_ref = &net;
     let table = &table;
@@ -822,7 +822,7 @@ fn cmd_diag2(args: &[String]) -> ExitCode {
     let table = BearoffTable::build();
     let positions = sample_decisions(&net, m, seed, 8, 0);
 
-    let threads = default_threads();
+    let threads = arg(args, "--threads", default_threads()).max(1);
     let chunk = positions.len().div_ceil(threads);
     let net_ref = &net;
     let table = &table;

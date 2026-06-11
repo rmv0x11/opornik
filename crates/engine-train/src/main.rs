@@ -189,6 +189,10 @@ fn cmd_duel(args: &[String]) -> ExitCode {
     let pb = str_arg(args, "--b", "");
     let games = arg(args, "--games", 200);
     let plies = arg(args, "--plies", 1u8);
+    // Asymmetric depths: compare e.g. the v2 candidate at its in-browser
+    // budget (2-ply) against the production v1 at its full 3-ply.
+    let aplies = arg(args, "--a-plies", plies);
+    let bplies = arg(args, "--b-plies", plies);
     // Changing the seed yields INDEPENDENT games — required when extending a
     // duel for significance (the default replays the same dice sequences).
     let seed = arg(args, "--seed", 555u64);
@@ -200,12 +204,12 @@ fn cmd_duel(args: &[String]) -> ExitCode {
         }
     };
     let label = format!(
-        "A({pa} [{}]) vs B({pb} [{}]) @ {plies}-ply, seed {seed}",
+        "A({pa} [{}] @{aplies}p) vs B({pb} [{}] @{bplies}p), seed {seed}",
         eval_kind(&na),
         eval_kind(&nb)
     );
-    let a = SearchPolicy { eval: na, plies };
-    let b = SearchPolicy { eval: nb, plies };
+    let a = SearchPolicy { eval: na, plies: aplies };
+    let b = SearchPolicy { eval: nb, plies: bplies };
     let r = benchmark(&a, &b, games, seed);
     report(&label, &r);
     ExitCode::SUCCESS

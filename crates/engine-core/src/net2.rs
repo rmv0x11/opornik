@@ -34,6 +34,8 @@ const NET_MAGIC: &[u8; 4] = b"NNV2";
 const PAIR_MAGIC: &[u8; 4] = b"NV2P";
 const VERSION: u32 = 1;
 
+use crate::net::dot;
+
 /// One dense layer: `out × in` row-major weights + bias.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
@@ -95,10 +97,7 @@ impl NetV2 {
             let mut next = vec![0.0f32; layer.output];
             for (o, out) in next.iter_mut().enumerate() {
                 let row = &layer.w[o * layer.input..(o + 1) * layer.input];
-                let mut z = layer.b[o];
-                for (wi, xi) in row.iter().zip(&cur) {
-                    z += wi * xi;
-                }
+                let z = layer.b[o] + dot(row, &cur);
                 *out = if li < last { z.max(0.0) } else { z };
             }
             cur = next;

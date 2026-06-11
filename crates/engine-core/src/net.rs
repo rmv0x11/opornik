@@ -37,6 +37,39 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Dot product with 8 independent accumulator lanes: a single scalar
+/// accumulator is a loop-carried FP dependency the compiler may not reorder,
+/// so it serializes; explicit lanes hand it the reassociation and the loop
+/// compiles to packed FMAs (NEON/SSE). ~3-4× faster on rows 80..300 wide —
+/// this is the hot path of play, search and rollout labelling alike.
+#[inline]
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let ca = a.chunks_exact(8);
+    let cb = b.chunks_exact(8);
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (xa, xb) in ca.zip(cb) {
+        for k in 0..8 {
+            // mul_add needs hardware FMA: on wasm32 it lowers to a SOFTWARE
+            // fma call (exact-rounding contract) and would cripple the
+            // browser engine — plain mul+add still vectorizes everywhere.
+            #[cfg(target_arch = "wasm32")]
+            {
+                acc[k] += xa[k] * xb[k];
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                acc[k] = xa[k].mul_add(xb[k], acc[k]);
+            }
+        }
+    }
+    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
+}
+
 impl Net {
     /// All-zero network of the given shape (predicts 0.5 everywhere).
     pub fn zeros(input: usize, hidden: usize, output: usize) -> Net {
@@ -86,26 +119,17 @@ impl Net {
     }
 
     /// Forward pass returning `(hidden activations, outputs)` for training.
-    #[allow(clippy::needless_range_loop)] // explicit indexing reads clearer for matmul kernels
     fn forward_full(&self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
         debug_assert_eq!(x.len(), self.input);
         let mut hidden = vec![0.0f32; self.hidden];
-        for j in 0..self.hidden {
-            let mut z = self.b1[j];
+        for (j, h) in hidden.iter_mut().enumerate() {
             let row = &self.w1[j * self.input..(j + 1) * self.input];
-            for i in 0..self.input {
-                z += row[i] * x[i];
-            }
-            hidden[j] = z.tanh();
+            *h = (self.b1[j] + dot(row, x)).tanh();
         }
         let mut out = vec![0.0f32; self.output];
-        for k in 0..self.output {
-            let mut z = self.b2[k];
+        for (k, o) in out.iter_mut().enumerate() {
             let row = &self.w2[k * self.hidden..(k + 1) * self.hidden];
-            for j in 0..self.hidden {
-                z += row[j] * hidden[j];
-            }
-            out[k] = sigmoid(z);
+            *o = sigmoid(self.b2[k] + dot(row, &hidden));
         }
         (hidden, out)
     }

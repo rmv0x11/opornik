@@ -240,10 +240,10 @@ fn cmd_bench(args: &[String]) -> ExitCode {
 /// equity (with `--plies` lookahead) and show win% for each. Useful for hints and
 /// for manual sparring against an external engine (e.g. LogasAI).
 fn cmd_analyze(args: &[String]) -> ExitCode {
-    let net = match load_net(&str_arg(args, "--net", "")) {
+    let net = match load_eval(&str_arg(args, "--net", "")) {
         Some(n) => n,
         None => {
-            eprintln!("analyze: need a valid --net PATH");
+            eprintln!("analyze: need a valid --net PATH (v1 net or NV2P pair)");
             return ExitCode::FAILURE;
         }
     };
@@ -299,7 +299,8 @@ fn cmd_analyze(args: &[String]) -> ExitCode {
         .enumerate()
         .map(|(i, t)| {
             let eq = -position_equity(&net, &t.board, opp, plies - 1, head);
-            let win = 1.0 - net.evaluate_board(&t.board, opp).win;
+            let p = net.probs4(&t.board, opp);
+            let win = 1.0 - (p[0] + p[1]);
             (i, eq, win)
         })
         .collect();

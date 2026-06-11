@@ -40,3 +40,7 @@ net.bin
 test-results/
 playwright-report/
 train/.venv/
+data/gen*.tsv
+data/*-contact.bin
+data/*-race.bin
+data/distill*

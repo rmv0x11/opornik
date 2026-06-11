@@ -195,17 +195,10 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     let hplies = arg(args, "--hplies", 1u8);
     let vs = str_arg(args, "--vs", "heuristic");
 
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to read {path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let net = match Net::from_bytes(&bytes) {
+    let net = match load_eval(&path) {
         Some(n) => n,
         None => {
-            eprintln!("Malformed net file: {path}");
+            eprintln!("Failed to load net (v1 or NV2P pair): {path}");
             return ExitCode::FAILURE;
         }
     };

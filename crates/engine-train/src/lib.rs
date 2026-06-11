@@ -322,8 +322,8 @@ pub fn train_parallel(
 /// BOTH sides have borne off a checker: the table's race equity is win/loss
 /// only (capped at ±1), so truncating while a mars is still live would
 /// silently compress ±2 outcomes — the same gate `rollout_probs` uses.
-pub fn rollout_once(
-    net: &Net,
+pub fn rollout_once<E: Evaluator>(
+    eval: &E,
     table: &BearoffTable,
     start: &Board,
     start_mover: Player,
@@ -349,7 +349,7 @@ pub fn rollout_once(
         }
         let dice = rng.dice();
         let turns = generate_turns_cfg(&board, mover, dice, false, HEAD_LIMIT);
-        let idx = greedy(net, &turns, mover);
+        let idx = greedy(eval, &turns, mover);
         board = turns[idx].board.clone();
         mover = mover.opponent();
     }
@@ -357,8 +357,8 @@ pub fn rollout_once(
 }
 
 /// Mean equity and standard error for `mover` over `n` rollouts of a position.
-pub fn rollout_equity(
-    net: &Net,
+pub fn rollout_equity<E: Evaluator>(
+    eval: &E,
     table: &BearoffTable,
     board: &Board,
     mover: Player,
@@ -368,7 +368,7 @@ pub fn rollout_equity(
     let mut sum = 0.0f32;
     let mut sumsq = 0.0f32;
     for _ in 0..n {
-        let r = rollout_once(net, table, board, mover, rng);
+        let r = rollout_once(eval, table, board, mover, rng);
         sum += r;
         sumsq += r * r;
     }
@@ -427,8 +427,8 @@ pub fn phase_of(board: &Board, mover: Player) -> Phase {
 /// are truncated with the exact bear-off table only once BOTH sides have borne
 /// off a checker — from there a mars is impossible, so the table's race equity
 /// converts exactly to `P(win)` and the label stays unbiased.
-pub fn rollout_probs(
-    net: &Net,
+pub fn rollout_probs<E: Evaluator>(
+    eval: &E,
     table: &BearoffTable,
     start: &Board,
     start_mover: Player,
@@ -468,7 +468,7 @@ pub fn rollout_probs(
             }
             let dice = rng.dice();
             let turns = generate_turns_cfg(&board, mover, dice, false, HEAD_LIMIT);
-            let idx = greedy(net, &turns, mover);
+            let idx = greedy(eval, &turns, mover);
             board = turns[idx].board.clone();
             mover = mover.opponent();
         }
@@ -518,8 +518,8 @@ pub fn best_index<E: Evaluator>(eval: &E, turns: &[Turn], mover: Player, extra_p
 /// is returned at its exact point value — expanding "replies" to a finished
 /// game would let the loser bear off a checker and demote a mars to an oin
 /// (or, with both off-counts at 15, even flip the recorded winner).
-pub fn rollout_leaf_value(
-    net: &Net,
+pub fn rollout_leaf_value<E: Evaluator>(
+    eval: &E,
     table: &BearoffTable,
     after: &Board,
     mover: Player,
@@ -539,9 +539,9 @@ pub fn rollout_leaf_value(
         for d2 in d1..=6u8 {
             let w = if d1 == d2 { 1.0 } else { 2.0 };
             let replies = generate_turns_cfg(after, opp, [d1, d2], false, HEAD_LIMIT);
-            let ri = best_index(net, &replies, opp, 0);
+            let ri = best_index(eval, &replies, opp, 0);
             let leaf = &replies[ri].board;
-            val += w * rollout_equity(net, table, leaf, mover, leaf_trials, rng).0;
+            val += w * rollout_equity(eval, table, leaf, mover, leaf_trials, rng).0;
         }
     }
     val / 36.0
@@ -560,8 +560,8 @@ pub fn rollout_leaf_value(
 /// * with `min_phase > 0`, sampling continues past `m` until every phase
 ///   (head/contact/race/bearoff) has at least `min_phase` decisions, so
 ///   per-phase error reports don't rest on n=4 buckets.
-pub fn sample_decisions(
-    net: &Net,
+pub fn sample_decisions<E: Evaluator>(
+    eval: &E,
     m: usize,
     seed: u64,
     per_game: usize,
@@ -602,7 +602,7 @@ pub fn sample_decisions(
                     taken += 1;
                 }
             }
-            let idx = best_index(net, &turns, mover, 0);
+            let idx = best_index(eval, &turns, mover, 0);
             board = turns[idx].board.clone();
             mover = mover.opponent();
         }

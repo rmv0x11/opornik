@@ -44,6 +44,26 @@ impl engine_core::search::Evaluator for AnyEval {
     }
 }
 
+impl AnyEval {
+    /// Outcome probabilities `[win_oin, win_mars, lose_oin, lose_mars]` —
+    /// the v1 net's 3 outputs widened, or the v2 pair's native 4-softmax.
+    fn probs4(&self, board: &Board, mover: Player) -> [f32; 4] {
+        match self {
+            AnyEval::V1(n) => {
+                let q = n.evaluate_board(board, mover);
+                let lose = (1.0 - q.win).max(0.0);
+                [
+                    (q.win - q.win_mars).max(0.0),
+                    q.win_mars,
+                    (lose - q.lose_mars).max(0.0),
+                    q.lose_mars,
+                ]
+            }
+            AnyEval::V2(p) => p.probs(board, mover),
+        }
+    }
+}
+
 /// Load a net of either format, sniffing the `NV2P` magic.
 fn load_eval(path: &str) -> Option<AnyEval> {
     let bytes = std::fs::read(path).ok()?;
@@ -444,20 +464,13 @@ fn cmd_er(args: &[String]) -> ExitCode {
         println!("Loaded {} labelled decisions from {load}", out.len());
         out
     } else {
-        let AnyEval::V1(ref net) = eval else {
-            eprintln!(
-                "er: generating fresh labels requires a v1 net (its 1-ply policy \
-                 drives sampling and rollouts); score v2 pairs via --load"
-            );
-            return ExitCode::FAILURE;
-        };
         println!("Building bear-off table (rollout truncation)...");
         let table = BearoffTable::build();
-        let positions = sample_decisions(net, m, seed, 8, stratify);
+        let positions = sample_decisions(&eval, m, seed, 8, stratify);
 
         let threads = default_threads();
         let chunk = positions.len().div_ceil(threads);
-        let net_ref: &Net = net;
+        let net_ref = &eval;
         let table = &table;
         let mut decisions: Vec<LabeledDecision> = Vec::with_capacity(positions.len());
         std::thread::scope(|s| {
@@ -583,10 +596,12 @@ fn cmd_er(args: &[String]) -> ExitCode {
 /// path): positions from the net's self-play, labels = outcome probabilities
 /// `[win_oin, win_mars, lose_oin, lose_mars]` from truncated rollouts.
 fn cmd_dataset(args: &[String]) -> ExitCode {
-    let net = match load_net(&str_arg(args, "--net", "")) {
+    // The policy net may be either generation: gen-N+1 data is labelled by
+    // the CURRENT champion's policy, whichever format that is.
+    let net = match load_eval(&str_arg(args, "--net", "")) {
         Some(n) => n,
         None => {
-            eprintln!("dataset: need a valid --net PATH");
+            eprintln!("dataset: need a valid --net PATH (v1 net or NV2P pair)");
             return ExitCode::FAILURE;
         }
     };
@@ -710,17 +725,8 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
                                 .wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         );
                         let p = if distill {
-                            // Distillation: the net's own outcome probabilities,
-                            // widened from 3 outputs to the 4-class vector
-                            // (win = oin + mars on each side).
-                            let q = net_ref.evaluate_board(board, *to_roll);
-                            let lose = (1.0 - q.win).max(0.0);
-                            [
-                                (q.win - q.win_mars).max(0.0),
-                                q.win_mars,
-                                (lose - q.lose_mars).max(0.0),
-                                q.lose_mars,
-                            ]
+                            // Distillation: the net's own outcome probabilities.
+                            net_ref.probs4(board, *to_roll)
                         } else {
                             rollout_probs(net_ref, table, board, *to_roll, trials, &mut rng)
                         };

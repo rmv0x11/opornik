@@ -593,8 +593,18 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
     let seed = arg(args, "--seed", 4242u64);
     let explore = arg(args, "--explore", 0.03f32);
     let exclude = str_arg(args, "--exclude", "");
+    // --label rollout (default): unbiased truncated-rollout probabilities —
+    // the wildbg target. --label net: the sampling net's OWN probabilities —
+    // cheap distillation labels (~10µs/row vs ~30s/row) to pre-train a v2 net
+    // toward champion level before rollout fine-tuning.
+    let label = str_arg(args, "--label", "rollout");
+    if label != "rollout" && label != "net" {
+        eprintln!("dataset: --label must be rollout|net (got {label})");
+        return ExitCode::FAILURE;
+    }
+    let distill = label == "net";
     println!(
-        "dataset config: positions {m}, trials {trials}, seed {seed}, explore {explore}{}",
+        "dataset config: positions {m}, trials {trials}, seed {seed}, explore {explore}, label {label}{}",
         if exclude.is_empty() { String::new() } else { format!(", exclude {exclude}") },
     );
 
@@ -664,10 +674,14 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
         }
     }
     println!(
-        "Collected {} unique to-roll states ({:.1}s); rolling out {} trials each…",
+        "Collected {} unique to-roll states ({:.1}s); labelling ({})…",
         states.len(),
         t0.elapsed().as_secs_f32(),
-        trials
+        if distill {
+            "net distillation".to_string()
+        } else {
+            format!("{trials} rollout trials each")
+        }
     );
 
     // Label in parallel.
@@ -692,7 +706,21 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
                             seed ^ ((offset + j + 1) as u64)
                                 .wrapping_mul(0x9E37_79B9_7F4A_7C15),
                         );
-                        let p = rollout_probs(net_ref, table, board, *to_roll, trials, &mut rng);
+                        let p = if distill {
+                            // Distillation: the net's own outcome probabilities,
+                            // widened from 3 outputs to the 4-class vector
+                            // (win = oin + mars on each side).
+                            let q = net_ref.evaluate_board(board, *to_roll);
+                            let lose = (1.0 - q.win).max(0.0);
+                            [
+                                (q.win - q.win_mars).max(0.0),
+                                q.win_mars,
+                                (lose - q.lose_mars).max(0.0),
+                                q.lose_mars,
+                            ]
+                        } else {
+                            rollout_probs(net_ref, table, board, *to_roll, trials, &mut rng)
+                        };
                         let phase = phase_of(board, *to_roll);
                         out.push((
                             format!(
@@ -703,7 +731,7 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
                                 p[1],
                                 p[2],
                                 p[3],
-                                trials
+                                if distill { 0 } else { trials }
                             ),
                             phase.name(),
                         ));
@@ -721,13 +749,14 @@ fn cmd_dataset(args: &[String]) -> ExitCode {
     });
 
     let header = format!(
-        "# meta: cmd=dataset net={} positions={} trials={} seed={} explore={} exclude={}\n\
+        "# meta: cmd=dataset net={} positions={} trials={} seed={} explore={} label={} exclude={}\n\
          # opornik dataset: pos-spec \\t phase \\t p_win_oin \\t p_win_mars \\t p_lose_oin \\t p_lose_mars \\t trials\n",
         str_arg(args, "--net", ""),
         rows.len(),
-        trials,
+        if distill { 0 } else { trials },
         seed,
         explore,
+        label,
         if exclude.is_empty() { "-" } else { &exclude },
     );
     let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
@@ -1263,7 +1292,7 @@ fn main() -> ExitCode {
         Some("agree") => cmd_agree(&args[1..]),
         _ => {
             eprintln!(
-                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--stratify K] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E] [--exclude EVALSET]   (rollout-labelled training data)\n  engine-train encode --in dataset.tsv --out-prefix PATH   (TSV → NNF2 feature matrices for train/train_v2.py)\n  engine-train netbench [--in PATH] [--iters N]   (v1 vs v2 forward-pass speed)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
+                "usage:\n  engine-train train [--games N] [--hidden H] [--lr L] [--explore E] [--seed S] [--threads T] [--sync K] [--init PATH] [--out PATH] [--selfplay-plies P] [--target-plies P]\n  engine-train bench --in PATH [--games N] [--plies P] [--vs heuristic|random] [--hplies P]\n  engine-train duel --a PATH --b PATH [--games N] [--plies P]\n  engine-train analyze --net PATH --white \"24:13,18:2\" --black \"24:15\" --dice 3,1 --turn W [--plies P] [--head unlimited] [--white-off N] [--black-off N] [--top N]\n  engine-train er --in PATH [--positions M] [--trials N] [--seed S] [--stratify K] [--per-phase] [--save FILE | --load FILE]\n  engine-train dataset --net PATH --out FILE [--positions M] [--trials N] [--seed S] [--explore E] [--exclude EVALSET] [--label rollout|net]   (rollout-labelled training data)\n  engine-train encode --in dataset.tsv --out-prefix PATH   (TSV → NNF2 feature matrices for train/train_v2.py)\n  engine-train netbench [--in PATH] [--iters N]   (v1 vs v2 forward-pass speed)\n  engine-train diag2 --net PATH [--positions M] [--trials N] [--leaf-trials K] [--seed S]   (does 2-ply help with rollout leaves?)\n  engine-train relay --net PATH [--ply P] [--top N]   (reads position lines from stdin → best plays)\n  engine-train agree --net PATH [--file decisions.txt] [--mat match.MAT] [--ply P]   (move-agreement % + ER vs LogasAI)"
             );
             ExitCode::FAILURE
         }

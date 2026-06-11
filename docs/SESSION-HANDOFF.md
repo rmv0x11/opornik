@@ -16,7 +16,7 @@
 **Дальше:** gen-3 train (накопленные gen1+gen2+gen3 ≈ 170k строк, --init gen2-warm, lr 3e-4) → duel/er vs ОБОИХ чемпионов → этап 3 плана (прайм-проверка: блок-позиции, строит/держит ли сеть заборы) → этап 4 (WASM/прод).
 
 Живой сайт: https://rmv0x11.github.io/opornik/ · деплой автоматический (правило `auto-deploy-no-ask`).
-Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.20** (`index-BFDk_k-8.js`, gh-pages коммит `972dc87`; live-тесты 2/2 зелёные).
+Версионирование: `web/package.json` → `__APP_VERSION__` (подвал меню) + `CHANGELOG.md` + версия в коммите ветки `gh-pages`. **В проде сейчас — v0.9.22** (`index-Clbpq-NP.js`, gh-pages `04487a0`; проверено 2026-06-11) = исходникам, недокаченного нет.
 
 ## Сессия v0.9.20 (2026-06-10, задеплоено; исходники закоммичены `740885c` в `feature/single-player-v0.9.10` и запушены)
 - **«Разбор партии»** (`.postgame`, рендер при `phase==='over' && reviewStats`): структурированный `gameResult` (`{winnerIsHuman: bool|null, points}`, ставится в `finishGame` + draw-ветке `announceBoardWin`, чистится в `nextGame` И `rewindTo`); счётчики «✓ лучших/неточностей/ошибок» по `scoredMoves` (= `history.filter(isHuman && !cube && loss != null)`; у ходов ИИ `loss` захардкожен 0 — их НЕ оцениваем); точность = средняя потеря экв./ход + грейд (`gradeLabel`); спарклайн SVG (`sparkPoints`, win человека по ходам: `h.isHuman ? h.win : 1-h.win`, замкнут результатом); «главные потери» топ-3 (`worstMoves`, loss≥0.02) — клик `openReview(idx)` → `logOpen=true; reviewIdx=idx` + scrollIntoView строки. Классы только `.postgame/.pg-*` (НЕ переиспользовать `.review/.ranked/.logrow/.status` — strict-mode у тестов).

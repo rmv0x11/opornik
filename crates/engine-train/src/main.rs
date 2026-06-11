@@ -169,6 +169,9 @@ fn cmd_duel(args: &[String]) -> ExitCode {
     let pb = str_arg(args, "--b", "");
     let games = arg(args, "--games", 200);
     let plies = arg(args, "--plies", 1u8);
+    // Changing the seed yields INDEPENDENT games — required when extending a
+    // duel for significance (the default replays the same dice sequences).
+    let seed = arg(args, "--seed", 555u64);
     let (na, nb) = match (load_eval(&pa), load_eval(&pb)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
@@ -177,13 +180,13 @@ fn cmd_duel(args: &[String]) -> ExitCode {
         }
     };
     let label = format!(
-        "A({pa} [{}]) vs B({pb} [{}]) @ {plies}-ply",
+        "A({pa} [{}]) vs B({pb} [{}]) @ {plies}-ply, seed {seed}",
         eval_kind(&na),
         eval_kind(&nb)
     );
     let a = SearchPolicy { eval: na, plies };
     let b = SearchPolicy { eval: nb, plies };
-    let r = benchmark(&a, &b, games, 555);
+    let r = benchmark(&a, &b, games, seed);
     report(&label, &r);
     ExitCode::SUCCESS
 }

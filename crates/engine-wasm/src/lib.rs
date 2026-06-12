@@ -6,10 +6,10 @@
 
 mod dto;
 
-use engine_core::analysis::{analyze_cube, CubeContext};
+use engine_core::analysis::{analyze_cube, CubeContext, Probabilities};
 use engine_core::{
     best_turn_search, best_turn_search_budget, position_equity, position_equity_width, BearoffTable,
-    Board, Evaluator, GameState, Net, Player, Rules, Variant, ROOT_WIDTH, SEARCH_WIDTH,
+    Board, Evaluator, GameState, Net, PhaseNets, Player, Rules, Variant, ROOT_WIDTH, SEARCH_WIDTH,
 };
 
 /// Hard leaf-evaluation budget for the 3-ply play search, so Expert stays
@@ -20,13 +20,43 @@ use wasm_bindgen::prelude::*;
 
 use dto::*;
 
-/// The trained net, bundled at compile time (≈64 KB).
+/// The v1 trained net, bundled at compile time (≈64 KB) — the FALLBACK when no
+/// v2 weights are supplied (e.g. the asset fetch failed offline). The much
+/// stronger v2 phase-net pair (~1.5 MB) is fetched at runtime by the worker and
+/// passed in via [`Engine::with_v2_bytes`], keeping the .wasm itself small.
 const NET_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/nardy-net.bin"));
+
+/// Either net generation behind one interface. v2 (contact/race phase nets,
+/// prime-aware encoding) beats v1 even when searching one ply shallower —
+/// measured 56.3% for v2@2-ply vs v1@3-ply over 300 games (p=0.028) — so when
+/// v2 is active the search depth is capped at 2 ply (see [`Engine::play_ply`]).
+enum NetKind {
+    V1(Net),
+    V2(PhaseNets),
+}
+
+impl NetKind {
+    fn evaluate_board(&self, b: &Board, m: Player) -> Probabilities {
+        match self {
+            NetKind::V1(n) => n.evaluate_board(b, m),
+            NetKind::V2(p) => p.evaluate_board(b, m),
+        }
+    }
+}
+
+impl Evaluator for NetKind {
+    fn equity(&self, b: &Board, m: Player) -> f32 {
+        match self {
+            NetKind::V1(n) => n.equity(b, m),
+            NetKind::V2(p) => Evaluator::equity(p, b, m),
+        }
+    }
+}
 
 /// Evaluator that uses the exact bear-off table for pure races and the net
 /// otherwise — borrowing both (no clones), mirroring `engine_core::Composite`.
 struct RaceOrNet<'a> {
-    net: &'a Net,
+    net: &'a NetKind,
     bearoff: &'a BearoffTable,
 }
 
@@ -59,8 +89,20 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<String, JsError> {
 #[wasm_bindgen]
 pub struct Engine {
     game: GameState,
-    net: Net,
+    net: NetKind,
     bearoff: Option<BearoffTable>,
+}
+
+impl Engine {
+    /// Effective search depth: the v2 nets are ~7× costlier per eval, and at
+    /// 2 ply already outplay v1 at 3 ply — cap their depth so every difficulty
+    /// stays responsive in the browser.
+    fn play_ply(&self, ply: u8) -> u8 {
+        match self.net {
+            NetKind::V1(_) => ply,
+            NetKind::V2(_) => ply.min(2),
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -74,7 +116,7 @@ impl Engine {
         Engine::with_net_bytes(variant, NET_BYTES)
     }
 
-    /// Create with caller-supplied net bytes (hot-swappable / fetched weights).
+    /// Create with caller-supplied v1 net bytes (hot-swappable / fetched weights).
     #[wasm_bindgen(js_name = withNetBytes)]
     pub fn with_net_bytes(variant: &str, bytes: &[u8]) -> Result<Engine, JsError> {
         let net = Net::from_bytes(bytes).ok_or_else(|| JsError::new("net weights malformed"))?;
@@ -84,9 +126,32 @@ impl Engine {
         let rules = Rules::for_variant(parse_variant(variant).map_err(js_err)?);
         Ok(Engine {
             game: GameState::new(rules),
-            net,
+            net: NetKind::V1(net),
             bearoff: None,
         })
+    }
+
+    /// Create with caller-supplied v2 phase-net pair bytes (`NV2P` blob fetched
+    /// by the worker). Shape/format validation lives in the loader.
+    #[wasm_bindgen(js_name = withV2Bytes)]
+    pub fn with_v2_bytes(variant: &str, bytes: &[u8]) -> Result<Engine, JsError> {
+        let nets =
+            PhaseNets::from_bytes(bytes).ok_or_else(|| JsError::new("v2 weights malformed"))?;
+        let rules = Rules::for_variant(parse_variant(variant).map_err(js_err)?);
+        Ok(Engine {
+            game: GameState::new(rules),
+            net: NetKind::V2(nets),
+            bearoff: None,
+        })
+    }
+
+    /// Which net generation is active ("v1"|"v2") — for UI/diagnostics.
+    #[wasm_bindgen(js_name = netGeneration)]
+    pub fn net_generation(&self) -> String {
+        match self.net {
+            NetKind::V1(_) => "v1".to_string(),
+            NetKind::V2(_) => "v2".to_string(),
+        }
     }
 
     /// Current position as JSON `PositionDto`.
@@ -146,6 +211,7 @@ impl Engine {
     /// JSON `BestMoveDto` (chosen turn + equity + mover-perspective probabilities).
     #[wasm_bindgen(js_name = bestMove)]
     pub fn best_move(&mut self, ply: u8) -> Result<String, JsError> {
+        let ply = self.play_ply(ply);
         let dice = self.game.dice.ok_or_else(|| JsError::new("no dice set"))?;
         let first = self.game.is_first_turn() && self.game.rules.head_doubles_exception;
         let mover = self.game.turn;
@@ -196,6 +262,7 @@ impl Engine {
     /// `ply==1` uses the net's static eval; `ply>=2` re-scores with search.
     #[wasm_bindgen(js_name = analyze)]
     pub fn analyze(&mut self, ply: u8) -> Result<String, JsError> {
+        let ply = self.play_ply(ply);
         let mover = self.game.turn;
         let opp = mover.opponent();
         let head_limit = self.game.rules.head_limit;
@@ -258,6 +325,7 @@ impl Engine {
     /// Equity (mover's view) of the current position searched `ply` deep.
     #[wasm_bindgen(js_name = equity)]
     pub fn equity(&mut self, ply: u8) -> f32 {
+        let ply = self.play_ply(ply);
         let mover = self.game.turn;
         let head_limit = self.game.rules.head_limit;
         if self.bearoff.is_none() {

@@ -7,6 +7,11 @@ import wasmUrl from './pkg/engine_wasm_bg.wasm?url';
 
 let engine: Engine | null = null;
 let wasmReady = false;
+// v2 phase-net weights (~1.5 MB, fetched once per worker). null = fetch failed
+// or not attempted yet → the engine falls back to the embedded v1 net, so the
+// game always works (e.g. offline after a partial cache).
+let v2Bytes: Uint8Array | null = null;
+let v2Tried = false;
 
 self.onmessage = async (e: MessageEvent) => {
   const { id, cmd, args } = e.data;
@@ -26,8 +31,19 @@ self.onmessage = async (e: MessageEvent) => {
         await init({ module_or_path: wasmBytes });
         wasmReady = true;
       }
-      // (Re)create the engine for the chosen variant.
-      engine = new Engine(args.variant);
+      if (!v2Tried) {
+        // Fetch the v2 weights once; any failure silently keeps the v1 fallback.
+        v2Tried = true;
+        try {
+          const r = await fetch(`${import.meta.env.BASE_URL}nardy-v2-gen3.bin`);
+          if (r.ok) v2Bytes = new Uint8Array(await r.arrayBuffer());
+        } catch {
+          v2Bytes = null;
+        }
+      }
+      // (Re)create the engine for the chosen variant — v2 phase nets when the
+      // weights arrived, the embedded v1 net otherwise.
+      engine = v2Bytes ? Engine.withV2Bytes(args.variant, v2Bytes) : new Engine(args.variant);
       self.postMessage({ id, ok: JSON.parse(engine.getPosition()) });
       return;
     }

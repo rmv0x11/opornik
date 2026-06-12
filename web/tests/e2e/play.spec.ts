@@ -18,7 +18,9 @@ async function waitIdle(page: Page) {
 // move with sources highlighted). Builds the turn sub-move by sub-move, then
 // commits it via the explicit "Подтвердить ход" button (no auto-commit).
 async function makeHumanMove(page: Page) {
-  for (let i = 0; i < 32; i++) {
+  let idle = 0; // consecutive iterations with nothing actionable
+  let pickLast = false; // alternate dest picking after an undo, to leave a dead end
+  for (let i = 0; i < 64; i++) {
     const confirm = page.getByRole('button', { name: /Подтвердить ход/ });
     if (await confirm.isVisible().catch(() => false)) {
       await confirm.click();
@@ -26,25 +28,41 @@ async function makeHumanMove(page: Page) {
     }
     const dst = page.locator('.board .point.dest');
     if ((await dst.count()) > 0) {
-      await dst.first().click();
+      await (pickLast ? dst.last() : dst.first()).click();
       await page.waitForTimeout(340); // let the glide animation settle (ANIM_MS=300)
+      idle = 0;
       continue;
     }
     const bo = page.getByRole('button', { name: /Выкинуть/ });
     if (await bo.isVisible().catch(() => false)) {
       await bo.click();
       await page.waitForTimeout(480); // bear-off arc into the tray (BEAR_MS=440)
+      idle = 0;
       continue;
     }
     const src = page.locator('.board .point.source');
     if ((await src.count()) > 0) {
       await src.first().click();
+      idle = 0;
       continue;
     }
     // nothing actionable this instant (mid-animation / re-render) — wait and retry
     // rather than bailing, so a transiently-hidden "Подтвердить" never aborts the
     // move with it still pending
     await page.waitForTimeout(150);
+    idle++;
+    // a persistent dead end: sub-moves were picked that no legal sequence
+    // completes (so neither dests nor «Подтвердить» appear). Undo one sub-move
+    // and re-pick from the other end of the dest list.
+    if (idle >= 6) {
+      const undo = page.getByRole('button', { name: /Отменить/ });
+      if (await undo.isVisible().catch(() => false)) {
+        await undo.click();
+        await page.waitForTimeout(340);
+        pickLast = !pickLast;
+        idle = 0;
+      }
+    }
   }
 }
 

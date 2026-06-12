@@ -98,10 +98,18 @@
   };
   let history = $state<LogEntry[]>([]);
   let reviewIdx = $state<number | null>(null); // which log entry is expanded for review
-  // History viewing: the main board shows this entry's `before` snapshot
-  // (read-only) instead of the live position; null = live game.
+  // History viewing: the main board shows a past entry's `before` snapshot
+  // (read-only) instead of the live position. The source is either a game-sheet
+  // row of the CURRENT game (viewIdx) or a stored move from an earlier game of
+  // this match (viewPast — the match review's главные потери).
   let viewIdx = $state<number | null>(null);
-  const viewPos = $derived(viewIdx == null ? null : (history[viewIdx]?.before ?? null));
+  let viewPast = $state<{ game: number; h: LogEntry } | null>(null);
+  const viewing = $derived(viewIdx != null ? (history[viewIdx] ?? null) : (viewPast?.h ?? null));
+  const viewPos = $derived(viewing?.before ?? null);
+  function closeView() {
+    viewIdx = null;
+    viewPast = null;
+  }
   let logOpen = $state(true); // game-log panel expanded (plain div, not <details>, so
   // its scroll container flexes reliably — <details> wraps content in a box that
   // breaks flex-based internal scrolling)
@@ -176,6 +184,7 @@
   $effect(() => {
     void phase;
     viewIdx = null;
+    viewPast = null;
   });
   // severity of a move from its equity loss (human moves only)
   function sev(loss: number | null): '' | 'ok' | 'inacc' | 'blunder' {
@@ -233,6 +242,72 @@
       .sort((a, b) => b.h.loss! - a.h.loss!)
       .slice(0, 3),
   );
+
+  // ---- match review (Разбор матча) ----
+  // Every finished game of the match/session, snapshotted at its finish (the
+  // game sheet itself is wiped by «Следующая партия»). The worst-move entries
+  // keep their `before` boards, so positions stay viewable across games.
+  type GameSummary = {
+    game: number; // 1-based game number within this match/session
+    winnerIsHuman: boolean | null; // null = draw
+    points: number;
+    score: [number, number]; // running [human, ai] score after the game
+    stats: { n: number; best: number; inacc: number; blunder: number; avg: number } | null;
+    worst: LogEntry[];
+  };
+  let matchGames = $state<GameSummary[]>([]);
+  const matchStats = $derived.by(() => {
+    let n = 0;
+    let best = 0;
+    let inacc = 0;
+    let blunder = 0;
+    let totalLoss = 0;
+    for (const g of matchGames) {
+      if (!g.stats) continue;
+      n += g.stats.n;
+      best += g.stats.best;
+      inacc += g.stats.inacc;
+      blunder += g.stats.blunder;
+      totalLoss += g.stats.avg * g.stats.n;
+    }
+    return n ? { n, best, inacc, blunder, avg: totalLoss / n } : null;
+  });
+  const matchWorst = $derived(
+    matchGames
+      .flatMap((g) => g.worst.map((h) => ({ game: g.game, h })))
+      .sort((a, b) => b.h.loss! - a.h.loss!)
+      .slice(0, 3),
+  );
+  // Snapshot the just-finished game into the match review. Call right after
+  // `gameResult` is set; rewindTo's take-back pops the entry again on replay.
+  function recordGameSummary() {
+    if (!gameResult) return;
+    matchGames = [
+      ...matchGames,
+      {
+        game: matchGames.length + 1,
+        winnerIsHuman: gameResult.winnerIsHuman,
+        points: gameResult.points,
+        score: [matchScore[0], matchScore[1]],
+        stats: reviewStats,
+        worst: worstMoves.map(({ h }) => h),
+      },
+    ];
+  }
+  // Put a stored move from an earlier game on the board (toggle). On phones the
+  // board is far above the match panel, so scroll the viewbar into view — the
+  // tap must produce visible feedback (same pattern as openReview).
+  function viewMatchLoss(game: number, h: LogEntry) {
+    if (viewPast?.h === h) {
+      viewPast = null;
+      return;
+    }
+    viewIdx = null;
+    viewPast = { game, h };
+    setTimeout(() => {
+      document.querySelector('.viewbar')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }, 30);
+  }
   // Your win chance after every checker move (AI entries flipped to your side),
   // closed with the actual result — the data behind the review sparkline.
   const sparkPoints = $derived.by(() => {
@@ -255,6 +330,7 @@
   function openReview(idx: number) {
     logOpen = true;
     reviewIdx = idx;
+    viewPast = null;
     viewIdx = idx;
     setTimeout(() => {
       document
@@ -737,6 +813,7 @@
     else matchScore[1] += points;
     if (currentGameCrawford) crawfordPlayed = true;
     gameResult = { winnerIsHuman: winner === humanColor, points };
+    recordGameSummary();
     if (!silent) {
       if (winner === humanColor) sfx.win();
       else sfx.lose();
@@ -761,6 +838,7 @@
         matchLength != null ? ` (матч ${matchScore[0]}:${matchScore[1]})` : ''
       }.`;
       gameResult = { winnerIsHuman: null, points: 0 };
+      recordGameSummary();
       phase = 'over';
       return;
     }
@@ -778,6 +856,24 @@
     const p = displayPos ?? pos;
     return p ? (humanColor === 'white' ? p.off[0] : p.off[1]) >= 1 : false;
   });
+
+  // The engine concedes a dead game instead of grinding out the bear-off.
+  // Оин (1 pt) once it has a checker off — mars is impossible then, so conceding
+  // forfeits nothing the human could still win. With no checker off, conceding
+  // would hand over a марс (2 pt), so it only does that when the mars is already
+  // near-certain anyway. Probabilities are read from the AI's perspective (it is
+  // the mover when this runs, at the start of its turn).
+  async function aiResignIfHopeless(): Promise<boolean> {
+    if (!pos) return false;
+    const aiOff = aiColor === 'white' ? pos.off[0] : pos.off[1];
+    const p = await engine.winProbabilities();
+    const asMars = aiOff === 0;
+    const hopeless = asMars ? p.win < 0.001 && p.lose_mars > 0.998 : p.win < 0.005;
+    if (!hopeless) return false;
+    const points = (asMars ? 2 : 1) * pos.cube.value;
+    finishGame(humanColor, points, asMars ? 'Движок сдался с марсом' : 'Движок сдался (оин)');
+    return true;
+  }
 
   // The human concedes the game: оин (1 pt) or марс (2 pt), times the cube.
   function resign(mars: boolean) {
@@ -825,6 +921,16 @@
     await engine.init(g.variant);
     matchScore = [g.matchScore[0], g.matchScore[1]];
     crawfordPlayed = g.crawfordPlayed;
+    // restore the finished games of the match — recordGameSummary numbers the
+    // next game as matchGames.length + 1, so this keeps №/score consistent
+    matchGames = (g.playedGames ?? []).map((s) => ({
+      game: s.game,
+      winnerIsHuman: s.winnerIsHuman,
+      points: s.points,
+      score: [s.score[0], s.score[1]],
+      stats: s.stats,
+      worst: s.worst,
+    }));
     pos = await engine.setPosition(g.setup);
     currentGameCrawford = !!g.setup.crawford;
     await updateWin();
@@ -935,6 +1041,28 @@
       matchLength,
       matchScore: [matchScore[0], matchScore[1]],
       crawfordPlayed,
+      // finished games of this match, so «Разбор матча» survives a resume.
+      // The worst-move boards are the heavy part (~1 КБ each), so they are
+      // kept only for the most recent games — an endless денежная серия must
+      // not bloat the save towards the localStorage quota. Rows stay complete.
+      playedGames: matchGames.map((g, i) => ({
+        game: g.game,
+        winnerIsHuman: g.winnerIsHuman,
+        points: g.points,
+        score: [g.score[0], g.score[1]] as [number, number],
+        stats: g.stats,
+        worst: (matchGames.length - i <= 12 ? g.worst : []).map((h) => ({
+          n: h.n,
+          color: h.color,
+          dice: h.dice,
+          notation: h.notation,
+          win: h.win,
+          loss: h.loss,
+          before: h.before,
+          ranked: null,
+          isHuman: h.isHuman,
+        })),
+      })),
       setup: {
         variant,
         turn: pos.turn,
@@ -1043,11 +1171,14 @@
   function toggleReview(i: number) {
     if (reviewIdx === i) {
       reviewIdx = null;
-      viewIdx = null;
+      closeView();
     } else {
       reviewIdx = i;
       // once in viewing mode, follow the expanded row across the board snapshots
-      if (viewIdx != null) viewIdx = i;
+      if (viewIdx != null || viewPast) {
+        viewPast = null;
+        viewIdx = i;
+      }
     }
   }
   // Rewind the engine to just before the move at `idx`, discard everything after.
@@ -1061,10 +1192,13 @@
       if (gameResult.winnerIsHuman === true) matchScore[0] -= gameResult.points;
       else if (gameResult.winnerIsHuman === false) matchScore[1] -= gameResult.points;
       if (currentGameCrawford) crawfordPlayed = false;
+      // the finished game is being replayed — drop its match-review entry
+      // (recorded together with gameResult; re-recorded when it finishes again)
+      matchGames = matchGames.slice(0, -1);
     }
     gameResult = null;
     reviewIdx = null;
-    viewIdx = null;
+    closeView();
     clearAnalysis();
     clearMoveBuild();
     aiLast = null;
@@ -1232,6 +1366,7 @@
     phase = 'ai';
     status = 'Ход движка…';
     try {
+      if (await aiResignIfHopeless()) return;
       if (
         hasCube &&
         pos &&
@@ -1369,6 +1504,7 @@
       aiAnim = null;
       history = [];
       reviewIdx = null;
+      closeView();
       gameResult = null;
       pos = await engine.reset();
       currentGameCrawford = crawfordForNext();
@@ -1384,6 +1520,7 @@
   async function newMatch() {
     matchScore = [0, 0];
     crawfordPlayed = false;
+    matchGames = [];
     await nextGame();
   }
 
@@ -1430,7 +1567,7 @@
     </div>
 
     {#snippet boardCenter()}
-      {#if viewIdx != null}
+      {#if viewing}
         <!-- history viewing: no game actions on a past position -->
       {:else if phase === 'openingRoll' && !openRoll}
         <button class="act primary" onclick={doOpeningRoll}>🎲 Разыграть первый ход</button>
@@ -1452,29 +1589,29 @@
       {/if}
     {/snippet}
 
-    {#if viewIdx != null && history[viewIdx]}
+    {#if viewing}
       <div class="viewbar">
         <span class="vb-txt">
-          👁 позиция перед ходом №{history[viewIdx].n}
-          {#if history[viewIdx].dice}· {history[viewIdx].dice![0]}-{history[viewIdx].dice![1]}{/if}
-          · {history[viewIdx].notation}
+          👁 позиция перед ходом
+          {#if viewPast}партия {viewPast.game} ·{/if}
+          №{viewing.n}
+          {#if viewing.dice}· {viewing.dice[0]}-{viewing.dice[1]}{/if}
+          · {viewing.notation}
         </span>
-        <button type="button" class="vb-close" onclick={() => (viewIdx = null)}>
-          ✕ к текущей позиции
-        </button>
+        <button type="button" class="vb-close" onclick={closeView}>✕ к текущей позиции</button>
       </div>
     {/if}
 
     <Board
       position={viewPos ?? displayPos ?? aiAnim ?? pos}
       orientation={humanColor}
-      interactive={phase === 'humanMove' && !animating && viewIdx == null}
-      sources={phase === 'humanMove' && viewIdx == null ? [...sourceCells] : []}
-      dests={viewIdx == null ? destCells : []}
-      selected={viewIdx != null || selSource == null ? null : phys(humanColor, selSource)}
-      lastCells={viewIdx == null ? lastCells : []}
-      glide={viewIdx == null ? glide : null}
-      canRoll={phase === 'humanRoll' && viewIdx == null}
+      interactive={phase === 'humanMove' && !animating && !viewing}
+      sources={phase === 'humanMove' && !viewing ? [...sourceCells] : []}
+      dests={viewing ? [] : destCells}
+      selected={viewing || selSource == null ? null : phys(humanColor, selSource)}
+      lastCells={viewing ? [] : lastCells}
+      glide={viewing ? null : glide}
+      canRoll={phase === 'humanRoll' && !viewing}
       {bearOffCell}
       {boardStyle}
       center={boardCenter}
@@ -1725,6 +1862,86 @@
         </div>
       {/if}
 
+      {#if phase === 'over' && matchGames.length >= 2}
+        <div class="postgame">
+          <div class="pg-head">
+            {matchLength != null ? 'Разбор матча' : 'Разбор серии'}
+            <span
+              class="pg-res"
+              class:won={matchOver && matchScore[0] > matchScore[1]}
+              class:lost={matchOver && matchScore[0] < matchScore[1]}
+            >
+              {matchOver
+                ? matchScore[0] > matchScore[1]
+                  ? `🏆 победа ${matchScore[0]}:${matchScore[1]}`
+                  : `поражение ${matchScore[0]}:${matchScore[1]}`
+                : `счёт ${matchScore[0]}:${matchScore[1]}`}
+            </span>
+          </div>
+          <ol class="mg-games">
+            {#each matchGames as g (g.game)}
+              <li class="mg-row">
+                <span class="mg-no">№{g.game}</span>
+                <span
+                  class="mg-res"
+                  class:won={g.winnerIsHuman === true}
+                  class:lost={g.winnerIsHuman === false}
+                >
+                  {g.winnerIsHuman == null ? 'ничья' : g.winnerIsHuman ? `+${g.points}` : `−${g.points}`}
+                </span>
+                <span class="mg-score">{g.score[0]}:{g.score[1]}</span>
+                <span class="mg-acc">
+                  {g.stats ? `${g.stats.avg.toFixed(3)} экв./ход` : 'без оценки'}
+                </span>
+                {#if g.stats}
+                  <span class="mg-counts">
+                    ✓{g.stats.best}/{g.stats.n}{g.stats.inacc ? ` · ?${g.stats.inacc}` : ''}{g.stats
+                      .blunder
+                      ? ` · ✗${g.stats.blunder}`
+                      : ''}
+                  </span>
+                {/if}
+              </li>
+            {/each}
+          </ol>
+          {#if matchStats}
+            <div class="pg-stats">
+              <span class="pg-stat good">✓ лучших: {matchStats.best}/{matchStats.n}</span>
+              <span class="pg-stat warn">неточностей: {matchStats.inacc}</span>
+              <span class="pg-stat bad">ошибок: {matchStats.blunder}</span>
+            </div>
+            <div class="pg-grade">
+              точность за {matchLength != null ? 'матч' : 'серию'}
+              {matchStats.avg.toFixed(3)} экв./ход — {gradeLabel(matchStats.avg)}
+            </div>
+          {/if}
+          {#if matchWorst.length}
+            <div class="pg-worst">
+              <span class="pg-cap">
+                главные потери {matchLength != null ? 'матча' : 'серии'} (нажмите — позиция на
+                доске):
+              </span>
+              {#each matchWorst as w (w.h)}
+                <button
+                  type="button"
+                  class="pg-row"
+                  class:viewing={viewPast?.h === w.h}
+                  aria-pressed={viewPast?.h === w.h}
+                  onclick={() => viewMatchLoss(w.game, w.h)}
+                >
+                  <span class="pg-mv">
+                    {viewPast?.h === w.h ? '👁 ' : ''}партия {w.game} · №{w.h.n}{w.h.dice
+                      ? ` · ${w.h.dice[0]}-${w.h.dice[1]}`
+                      : ''} · {w.h.notation}
+                  </span>
+                  <span class="pg-loss">−{w.h.loss!.toFixed(3)}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
+
       {#if phase === 'humanRoll' || phase === 'humanMove'}
         <div class="savebar">
           <button class="ghost" onclick={doSave}>💾 Сохранить</button>
@@ -1816,7 +2033,13 @@
                       <div class="review-head">Ход движка — альтернативы не сохранены.</div>
                     {/if}
                     <div class="review-acts">
-                      <button class="ghost" onclick={() => (viewIdx = viewIdx === i ? null : i)}>
+                      <button
+                        class="ghost"
+                        onclick={() => {
+                          viewPast = null;
+                          viewIdx = viewIdx === i ? null : i;
+                        }}
+                      >
                         {viewIdx === i ? '✕ Скрыть позицию' : '👁 Позиция на доске'}
                       </button>
                       {#if h.isHuman}
@@ -2679,6 +2902,51 @@
     color: #b0413e;
     white-space: nowrap;
   }
+  .pg-row.viewing {
+    background: #f1e6d2;
+    border-color: #d8c7a8;
+  }
+  /* match review: one row per finished game */
+  .mg-games {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .mg-row {
+    display: grid;
+    grid-template-columns: 2.2rem 2.8rem 2.8rem minmax(0, 1fr) auto;
+    gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid #ecdfc9;
+    border-radius: 6px;
+    background: #fffdf8;
+    font: 400 0.82rem var(--font-mono, monospace);
+    color: #5a4632;
+  }
+  .mg-no {
+    color: #a08a6c;
+  }
+  .mg-res {
+    font-weight: var(--fw-semi);
+    color: #8a6a48;
+  }
+  .mg-res.won {
+    color: #2e7d32;
+  }
+  .mg-res.lost {
+    color: #b0413e;
+  }
+  .mg-score {
+    color: #a08a6c;
+  }
+  .mg-counts {
+    color: #a08a6c;
+    white-space: nowrap;
+  }
   .gamelog {
     margin-top: 0.9rem;
     border: 1px solid #e2d3bb;
@@ -3147,6 +3415,22 @@
        hide it to keep the screen fitting without scroll */
     .movelist {
       display: none;
+    }
+    /* match-review rows: the counts move to their own full-width line — an
+       auto track would be granted its max-content width BEFORE the 1fr
+       accuracy cell gets anything, squeezing «экв./ход» into a 3-line stack
+       (and overprinting it outright at 320px) */
+    .mg-row {
+      grid-template-columns: 2rem 2.4rem 2.4rem minmax(0, 1fr);
+      gap: 0.15rem 0.35rem;
+      font-size: 0.78rem;
+    }
+    .mg-acc {
+      white-space: nowrap;
+    }
+    .mg-counts {
+      grid-column: 1 / -1;
+      white-space: normal;
     }
     /* roomy, scrollable game log so the move-review (alternatives + replay) reads
        comfortably — the list scrolls inside this box; the page scrolls to reveal

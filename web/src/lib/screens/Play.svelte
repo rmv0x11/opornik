@@ -646,7 +646,7 @@
   function fmtTurn(t: TurnDto): string {
     if (t.is_pass) return 'пропуск';
     const ms = t.moves;
-    const segs: string[] = [];
+    const segs: { start: number; text: string }[] = [];
     let i = 0;
     while (i < ms.length) {
       const start = ms[i].from;
@@ -654,10 +654,12 @@
       // extend while the next sub-move continues the same checker (its source
       // is this hop's destination), stopping at a bear-off
       while (j + 1 < ms.length && !ms[j].bear_off && ms[j + 1].from === ms[j].to) j++;
-      segs.push(ms[j].bear_off ? `${start}/выкид` : `${start}/${ms[j].to}`);
+      segs.push({ start, text: ms[j].bear_off ? `${start}/выкид` : `${start}/${ms[j].to}` });
       i = j + 1;
     }
-    return segs.join('  ');
+    // checkers travel 24→1, so list segments along that path (highest start first)
+    segs.sort((a, b) => b.start - a.start);
+    return segs.map((s) => s.text).join('  ');
   }
   function occArr(p: PositionDto): number[] {
     const o = new Array(24).fill(0);

@@ -98,6 +98,10 @@
   };
   let history = $state<LogEntry[]>([]);
   let reviewIdx = $state<number | null>(null); // which log entry is expanded for review
+  // History viewing: the main board shows this entry's `before` snapshot
+  // (read-only) instead of the live position; null = live game.
+  let viewIdx = $state<number | null>(null);
+  const viewPos = $derived(viewIdx == null ? null : (history[viewIdx]?.before ?? null));
   let logOpen = $state(true); // game-log panel expanded (plain div, not <details>, so
   // its scroll container flexes reliably — <details> wraps content in a box that
   // breaks flex-based internal scrolling)
@@ -167,6 +171,12 @@
   function snap(p: PositionDto): PositionDto {
     return JSON.parse(JSON.stringify(p));
   }
+  // Any phase change (a move played, the AI's turn, a new roll) ends history
+  // viewing — the board snaps back to the live position.
+  $effect(() => {
+    void phase;
+    viewIdx = null;
+  });
   // severity of a move from its equity loss (human moves only)
   function sev(loss: number | null): '' | 'ok' | 'inacc' | 'blunder' {
     if (loss == null) return '';
@@ -240,10 +250,12 @@
       .map((p, i) => `${((i / last) * 100).toFixed(2)},${(2 + (1 - p) * 24).toFixed(2)}`)
       .join(' ');
   });
-  // Jump from the review panel to a move's expanded log entry.
+  // Jump from the review panel to a move's expanded log entry — and put the
+  // position at that moment on the board right away.
   function openReview(idx: number) {
     logOpen = true;
     reviewIdx = idx;
+    viewIdx = idx;
     setTimeout(() => {
       document
         .querySelector(`.gamelog .log li:nth-child(${idx + 1})`)
@@ -1029,7 +1041,14 @@
 
   // ---- review / replay from the game log ----
   function toggleReview(i: number) {
-    reviewIdx = reviewIdx === i ? null : i;
+    if (reviewIdx === i) {
+      reviewIdx = null;
+      viewIdx = null;
+    } else {
+      reviewIdx = i;
+      // once in viewing mode, follow the expanded row across the board snapshots
+      if (viewIdx != null) viewIdx = i;
+    }
   }
   // Rewind the engine to just before the move at `idx`, discard everything after.
   async function rewindTo(idx: number): Promise<boolean> {
@@ -1045,6 +1064,7 @@
     }
     gameResult = null;
     reviewIdx = null;
+    viewIdx = null;
     clearAnalysis();
     clearMoveBuild();
     aiLast = null;
@@ -1410,7 +1430,9 @@
     </div>
 
     {#snippet boardCenter()}
-      {#if phase === 'openingRoll' && !openRoll}
+      {#if viewIdx != null}
+        <!-- history viewing: no game actions on a past position -->
+      {:else if phase === 'openingRoll' && !openRoll}
         <button class="act primary" onclick={doOpeningRoll}>🎲 Разыграть первый ход</button>
       {:else if phase === 'humanRoll'}
         {#if canHumanDouble}
@@ -1430,16 +1452,29 @@
       {/if}
     {/snippet}
 
+    {#if viewIdx != null && history[viewIdx]}
+      <div class="viewbar">
+        <span class="vb-txt">
+          👁 позиция перед ходом №{history[viewIdx].n}
+          {#if history[viewIdx].dice}· {history[viewIdx].dice![0]}-{history[viewIdx].dice![1]}{/if}
+          · {history[viewIdx].notation}
+        </span>
+        <button type="button" class="vb-close" onclick={() => (viewIdx = null)}>
+          ✕ к текущей позиции
+        </button>
+      </div>
+    {/if}
+
     <Board
-      position={displayPos ?? aiAnim ?? pos}
+      position={viewPos ?? displayPos ?? aiAnim ?? pos}
       orientation={humanColor}
-      interactive={phase === 'humanMove' && !animating}
-      sources={phase === 'humanMove' ? [...sourceCells] : []}
-      dests={destCells}
-      selected={selSource == null ? null : phys(humanColor, selSource)}
-      {lastCells}
-      {glide}
-      canRoll={phase === 'humanRoll'}
+      interactive={phase === 'humanMove' && !animating && viewIdx == null}
+      sources={phase === 'humanMove' && viewIdx == null ? [...sourceCells] : []}
+      dests={viewIdx == null ? destCells : []}
+      selected={viewIdx != null || selSource == null ? null : phys(humanColor, selSource)}
+      lastCells={viewIdx == null ? lastCells : []}
+      glide={viewIdx == null ? glide : null}
+      canRoll={phase === 'humanRoll' && viewIdx == null}
       {bearOffCell}
       {boardStyle}
       center={boardCenter}
@@ -1780,9 +1815,14 @@
                     {:else}
                       <div class="review-head">Ход движка — альтернативы не сохранены.</div>
                     {/if}
-                    {#if h.isHuman}
-                      <button class="ghost" onclick={() => replayFrom(i)}>↩ Переиграть этот ход</button>
-                    {/if}
+                    <div class="review-acts">
+                      <button class="ghost" onclick={() => (viewIdx = viewIdx === i ? null : i)}>
+                        {viewIdx === i ? '✕ Скрыть позицию' : '👁 Позиция на доске'}
+                      </button>
+                      {#if h.isHuman}
+                        <button class="ghost" onclick={() => replayFrom(i)}>↩ Переиграть этот ход</button>
+                      {/if}
+                    </div>
                   </div>
                 {/if}
               </li>
@@ -1975,6 +2015,34 @@
     flex: 1;
     color: var(--ink-faint);
     font: 600 0.8rem var(--font-ui);
+  }
+  .viewbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 0.6rem;
+    padding: 0.35rem 0.6rem;
+    background: #f1e6d2;
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-sm);
+  }
+  .viewbar .vb-txt {
+    flex: 1;
+    font: 600 0.82rem ui-monospace, monospace;
+    color: var(--ink-wood);
+  }
+  .viewbar .vb-close {
+    flex: 0 0 auto;
+    background: var(--surface);
+    border: 1px solid var(--pill-border);
+    border-radius: var(--radius-sm);
+    color: var(--ink-wood);
+    font: 600 0.78rem var(--font-ui);
+    padding: 0.25rem 0.55rem;
+    cursor: pointer;
+  }
+  .viewbar .vb-close:hover {
+    background: #fcf8f1;
   }
   .bar-toggle {
     flex: 0 0 auto;
@@ -2938,6 +3006,11 @@
     font: 600 0.78rem system-ui;
     color: #a08a6a;
     margin-bottom: 0.35rem;
+  }
+  .review-acts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
   }
   .alts {
     list-style: none;

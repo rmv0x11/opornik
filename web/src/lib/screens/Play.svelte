@@ -535,6 +535,14 @@
     selSource = null;
   }
 
+  // Drag begun on a movable checker — always (re)select it. Unlike a click,
+  // a drag never means "play onto this cell".
+  function handleDragStart(cell: number) {
+    if (phase !== 'humanMove' || animating) return;
+    const p = posOfPhys(humanColor, cell);
+    if (nextHops.some((h) => h.from === p)) selSource = p;
+  }
+
   // Drag release over a destination cell — play the full chain to the FINAL square
   // (both dice in one gesture). The ghost already showed the motion, so no glide.
   function onDrop(cell: number) {
@@ -1616,6 +1624,7 @@
       {boardStyle}
       center={boardCenter}
       onPointClick={handlePointClick}
+      onDragStart={handleDragStart}
       {onDrop}
       onRoll={humanRoll}
       onBearOff={bearOffSelected}

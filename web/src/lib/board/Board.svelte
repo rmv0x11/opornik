@@ -17,6 +17,7 @@
     boardStyle = '',
     center,
     onPointClick,
+    onDragStart,
     onDrop,
     onRoll,
     onBearOff,
@@ -34,6 +35,7 @@
     boardStyle?: string; // theme CSS-variable overrides applied to the board
     center?: Snippet; // action buttons rendered centred ON the board (confirm/double/cube)
     onPointClick?: (cell: number) => void;
+    onDragStart?: (cell: number) => void; // drag begun on a source — force-select it
     onDrop?: (cell: number) => void; // drag release over a destination
     onRoll?: () => void; // tap the centre of the board to roll
     onBearOff?: () => void; // swipe a checker up (out of the board) to bear it off
@@ -72,11 +74,16 @@
     return Math.min(count, 5);
   }
   function click(cell: number) {
+    // a drag gesture already did its work (select / drop) — the browser still
+    // fires a trailing `click` after pointerup, which must not toggle anything
+    if (squelchClick) return;
     if (interactive) onPointClick?.(cell);
   }
 
   // ---- drag (select source on press-move, apply on release over a destination) ----
+  const DRAG_SLOP = 8; // px of movement before a press becomes a drag (≈ touch slop)
   const SWIPE_UP = 40; // px of upward drag that triggers a bear-off
+  let squelchClick = false;
   let downCell: number | null = null;
   let downXY = { x: 0, y: 0 };
   let dragging = $state(false);
@@ -102,10 +109,12 @@
     if (downCell == null) return;
     const dx = e.clientX - downXY.x;
     const dy = e.clientY - downXY.y;
-    if (!dragging && dx * dx + dy * dy > 36) {
+    if (!dragging && dx * dx + dy * dy > DRAG_SLOP * DRAG_SLOP) {
       dragging = true;
       dragColor = occupancy[downCell].color;
-      if (selected !== downCell) onPointClick?.(downCell); // select source → show dests
+      // force-select the dragged checker (onPointClick would instead PLAY onto
+      // this cell when it is a reachable destination of the previous selection)
+      if (selected !== downCell) (onDragStart ?? onPointClick)?.(downCell);
     }
     if (dragging) dragXY = { x: e.clientX, y: e.clientY };
   }
@@ -120,6 +129,10 @@
         // dragged the checker upward, out of the board → bear it off
         onBearOff?.();
       }
+      // the trailing click (fires synchronously after pointerup, when the release
+      // stayed on the pressed button) must not undo the selection / replay a move
+      squelchClick = true;
+      setTimeout(() => (squelchClick = false), 0);
     }
     dragging = false;
     dragColor = null;

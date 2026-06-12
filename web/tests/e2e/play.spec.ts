@@ -174,6 +174,30 @@ test('click-to-move: selecting a source shows destinations and a click registers
   ).toBeVisible({ timeout: 40_000 });
 });
 
+test('click-to-move: a click with a few px of jitter still selects the checker', async ({
+  page,
+}) => {
+  await startAndRoll(page);
+  // реальный палец/мышь дрожит между down и up — раньше это запускало драг,
+  // драг выбирал шашку, а хвостовой click тут же снимал выбор
+  const src = page.locator('.board .point.source').first();
+  const b = await src.boundingBox();
+  if (!b) throw new Error('missing bounding box');
+  await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(b.x + b.width / 2 + 9, b.y + b.height / 2 + 5);
+  await page.mouse.up();
+  await expect(page.locator('.board .point.selected')).toHaveCount(1);
+  await expect(page.locator('.board .point.dest').first()).toBeVisible();
+  // и клик по подсвеченному полю после такого выбора играет ход
+  await page.locator('.board .point.dest').first().click();
+  await expect(
+    page
+      .getByRole('button', { name: /Отменить/ })
+      .or(page.getByRole('button', { name: CONTROL })),
+  ).toBeVisible({ timeout: 40_000 });
+});
+
 test('drag-and-drop: dragging a checker onto a destination registers a hop', async ({ page }) => {
   await startAndRoll(page);
   const src = page.locator('.board .point.source').first();

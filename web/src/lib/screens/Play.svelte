@@ -4,6 +4,7 @@
   import type {
     CheckerMoveDto,
     CubeDecisionDto,
+    CubeDto,
     PlayerColor,
     PositionDto,
     RankedTurnDto,
@@ -199,6 +200,28 @@
     const s = sev(h.loss);
     const word = s === 'blunder' ? 'ошибка' : s === 'inacc' ? 'неточность' : '';
     return `−${h.loss.toFixed(3)}${word ? ' · ' + word : ''}`;
+  }
+  // Standing doubling-cube status for a game-sheet row, read from the turn's
+  // `before` snapshot — the cube in force when that turn was played (cube variants
+  // only). owner: center · yours · the engine's; glyph + colour distinguish them.
+  // Cube-ACTION rows (h.cube: double/take/pass/beaver) return null: their notation
+  // already spells out the transition («удвоение ×1 → ×2», «тайк»…), and their
+  // `before` snapshot of the cube owner is unreliable (taken before the engine
+  // state settles), so a badge there would be redundant and possibly wrong.
+  function cubeTag(h: LogEntry): { txt: string; cls: 'center' | 'me' | 'opp'; title: string } | null {
+    if (h.cube) return null;
+    const c: CubeDto = h.before.cube;
+    const cls = c.owner === null ? 'center' : c.owner === humanColor ? 'me' : 'opp';
+    const word = cls === 'center' ? 'в центре' : cls === 'me' ? 'у вас' : 'у движка';
+    return { txt: `${cls === 'center' ? '◇' : '◆'}×${c.value}`, cls, title: `Куб ×${c.value} — ${word}` };
+  }
+  // Plain-text cube column for the downloadable transcript (ц = центр, в = вы,
+  // д = движок). Empty for cube-action rows, as above.
+  function cubeText(h: LogEntry): string {
+    if (h.cube) return '';
+    const c: CubeDto = h.before.cube;
+    const mark = c.owner === null ? 'ц' : c.owner === humanColor ? 'в' : 'д';
+    return `×${c.value}${mark}`;
   }
 
   // ---- post-game review (Разбор партии) ----
@@ -1120,20 +1143,32 @@
     L.push(`Вы: ${me} · движок: ${opp} (поиск ${aiPly}-ply)`);
     L.push(`Сохранено: ${new Date().toLocaleString('ru-RU')}`);
     L.push('');
-    L.push([pad('№', 4), pad('игрок', 8), pad('кости', 6), pad('ход', 22), 'оценка'].join(' '));
-    L.push('─'.repeat(52));
+    const rule = '─'.repeat(hasCube ? 58 : 52);
+    L.push(
+      (hasCube
+        ? [pad('№', 4), pad('игрок', 8), pad('кости', 6), pad('куб', 5), pad('ход', 22), 'оценка']
+        : [pad('№', 4), pad('игрок', 8), pad('кости', 6), pad('ход', 22), 'оценка']
+      ).join(' '),
+    );
+    L.push(rule);
     for (const h of history) {
       const who = h.color === humanColor ? 'вы' : 'движок';
       if (h.cube) {
-        L.push(`${pad(String(h.n), 4)} ${pad(who, 8)} 🎲² ${h.notation}`);
+        // cube action: dice + куб columns stay blank (the transition is in the
+        // notation), but kept padded so the row aligns under the header
+        const cb = hasCube ? `${pad('', 5)} ` : '';
+        L.push(`${pad(String(h.n), 4)} ${pad(who, 8)} ${pad('', 6)} ${cb}🎲² ${h.notation}`);
         continue;
       }
       const dice = h.dice ? `${h.dice[0]}-${h.dice[1]}` : '';
       L.push(
-        [pad(String(h.n), 4), pad(who, 8), pad(dice, 6), pad(h.notation, 22), evalLabel(h)].join(' '),
+        (hasCube
+          ? [pad(String(h.n), 4), pad(who, 8), pad(dice, 6), pad(cubeText(h), 5), pad(h.notation, 22), evalLabel(h)]
+          : [pad(String(h.n), 4), pad(who, 8), pad(dice, 6), pad(h.notation, 22), evalLabel(h)]
+        ).join(' '),
       );
     }
-    L.push('─'.repeat(52));
+    L.push(rule);
     if (pos) L.push(`Пипсы: ⚪ ${pos.pip[0]} · ⚫ ${pos.pip[1]} · ход №${pos.turn_number}`);
     if (phase === 'over') L.push(status);
     L.push('');
@@ -2000,12 +2035,21 @@
                   class:me={h.color === humanColor}
                   class:active={reviewIdx === i}
                   class:cube={h.cube}
+                  class:cubevar={hasCube}
                   onclick={() => toggleReview(i)}
-                  title={h.cube ? 'Действие с кубом' : 'Показать другие варианты'}
+                  title={h.cube
+                    ? 'Действие с кубом'
+                    : hasCube
+                      ? `Показать другие варианты · ${cubeTag(h)?.title}`
+                      : 'Показать другие варианты'}
                 >
                   <span class="ln">{h.n}</span>
                   <span class="who">{h.color === humanColor ? 'вы' : 'движок'}</span>
                   <span class="dc">{h.dice ? `${h.dice[0]}-${h.dice[1]}` : ''}</span>
+                  {#if hasCube}
+                    {@const ct = cubeTag(h)}
+                    <span class="cb {ct ? `c-${ct.cls}` : ''}" title={ct?.title ?? ''}>{ct?.txt ?? ''}</span>
+                  {/if}
                   <span class="mv">{h.cube ? `🎲² ${h.notation}` : h.notation}</span>
                   <span class="ev">{evalLabel(h)}</span>
                   <span class="caret">{reviewIdx === i ? '▾' : '▸'}</span>
@@ -3225,6 +3269,35 @@
     text-align: left;
     cursor: pointer;
     border-radius: 5px;
+  }
+  /* cube variants get an extra column for the standing doubling-cube status */
+  .logrow.cubevar {
+    grid-template-columns: 1.6rem 3.2rem 2.4rem 3rem 1fr auto 0.9rem;
+  }
+  .logrow .cb {
+    white-space: nowrap;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    justify-self: center; /* hug the badge to its text, centred in the column */
+  }
+  /* the default ×1-in-centre cube is the quiet baseline — dim, no pill */
+  .logrow .cb.c-center {
+    color: #c2b69a;
+    font-weight: 400;
+  }
+  /* a turned cube (owned by someone) pops with a tinted pill in the owner's hue */
+  .logrow .cb.c-me,
+  .logrow .cb.c-opp {
+    padding: 0.04rem 0.3rem;
+    border-radius: 999px;
+  }
+  .logrow .cb.c-me {
+    color: #8a5a16;
+    background: #8a5a161a;
+  }
+  .logrow .cb.c-opp {
+    color: #5b6b8a;
+    background: #5b6b8a1a;
   }
   .logrow:hover {
     background: #f6efe2;

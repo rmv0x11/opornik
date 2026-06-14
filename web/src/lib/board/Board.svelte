@@ -13,6 +13,7 @@
     lastCells = [],
     glide = null,
     canRoll = false,
+    showCube = false,
     bearOffCell = null,
     boardStyle = '',
     center,
@@ -31,6 +32,7 @@
     lastCells?: number[]; // physical cells touched by the most recent move (pulse)
     glide?: { from: number; to: number; color: PlayerColor; bearOff?: boolean } | null; // fly a piece (point→point, or point→tray on bear-off)
     canRoll?: boolean; // show a clickable roll prompt in the centre
+    showCube?: boolean; // render the doubling cube on the board (cube variants only)
     bearOffCell?: number | null; // the selected checker's cell, if it can bear off
     boardStyle?: string; // theme CSS-variable overrides applied to the board
     center?: Snippet; // action buttons rendered centred ON the board (confirm/double/cube)
@@ -53,6 +55,11 @@
     return occ;
   });
   const slotToCell = $derived(buildSlotToCell(orientation));
+  // Doubling cube placement: centred on the bar while nobody owns it; once a player
+  // takes a double it sits on that player's side (you at the bottom, opponent up top).
+  const cubeSide = $derived<'center' | 'top' | 'bottom'>(
+    position.cube.owner == null ? 'center' : position.cube.owner === orientation ? 'bottom' : 'top',
+  );
   const sourceSet = $derived(new Set(sources));
   const destSet = $derived(new Set(dests));
   const lastSet = $derived(new Set(lastCells));
@@ -292,7 +299,7 @@
          plus whatever the host passes in `center` (confirm / double / cube reply).
          The container is click-through (pointer-events:none); only the buttons
          capture taps, so building a move on the board is never blocked. -->
-    <div class="board-actions">
+    <div class="board-actions" class:cube-shift={showCube && cubeSide === 'center'}>
       {#if canRoll}
         <button type="button" class="rollzone" onclick={() => onRoll?.()} aria-label="Бросить кости">
           <span class="cup-row">
@@ -304,6 +311,22 @@
       {/if}
       {@render center?.()}
     </div>
+
+    <!-- the doubling cube, sitting on the central bar: centred when unclaimed,
+         on the owning player's side once a double has been taken -->
+    {#if showCube}
+      <div
+        class="cube-piece {cubeSide}"
+        aria-label={`куб ${position.cube.value}, ${
+          cubeSide === 'center' ? 'в центре' : cubeSide === 'bottom' ? 'у вас' : 'у соперника'
+        }`}
+        title={`Куб ×${position.cube.value} — ${
+          cubeSide === 'center' ? 'в центре' : cubeSide === 'bottom' ? 'у вас' : 'у соперника'
+        }`}
+      >
+        <span class="cube-val">{position.cube.value}</span>
+      </div>
+    {/if}
   </div>
 
   <div class="rail">
@@ -391,6 +414,58 @@
   }
   .board-actions > :global(*) {
     pointer-events: auto; /* …except the buttons themselves */
+  }
+  /* when the doubling cube sits dead-centre, drop the action stack below it so the
+     roll-cup / «Удвоить» buttons never bury the cube during your roll */
+  .board-actions.cube-shift {
+    top: calc(50% + clamp(40px, var(--row-h) * 0.28, 74px));
+  }
+  /* doubling cube: an ivory tile on the central bar; value shown big and dark.
+     Centred while unclaimed, it slides to the owning player's half once taken.
+     z-index sits above the felt/checkers but below the action overlay (z 20), so
+     a transient roll-cup/confirm button can momentarily cover the centred cube. */
+  .cube-piece {
+    position: absolute;
+    left: 50%;
+    z-index: 8;
+    width: clamp(22px, calc(var(--pt) * 0.92), 42px);
+    height: clamp(22px, calc(var(--pt) * 0.92), 42px);
+    display: grid;
+    place-items: center;
+    border-radius: clamp(4px, calc(var(--pt) * 0.16), 8px);
+    background: linear-gradient(155deg, #fdf6e6, #e6d4ad);
+    box-shadow:
+      inset 0 1px 0 #fffaf0,
+      inset 0 -2px 3px #b89a64,
+      0 2px 5px rgba(0, 0, 0, 0.45);
+    color: #3a2c12;
+    pointer-events: none;
+    transition: top 0.35s var(--ease-decelerate, ease), transform 0.35s ease;
+  }
+  .cube-piece .cube-val {
+    font: 700 clamp(11px, calc(var(--pt) * 0.5), 22px) ui-monospace, monospace;
+    line-height: 1;
+  }
+  /* an owned cube (sitting on a player's side) gets a warm ring so it reads as "live" */
+  .cube-piece.top,
+  .cube-piece.bottom {
+    box-shadow:
+      inset 0 1px 0 #fffaf0,
+      inset 0 -2px 3px #b89a64,
+      0 0 0 2px rgba(170, 120, 40, 0.65),
+      0 2px 6px rgba(0, 0, 0, 0.5);
+  }
+  .cube-piece.center {
+    top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .cube-piece.top {
+    top: calc(var(--row-h) * 0.5);
+    transform: translate(-50%, -50%);
+  }
+  .cube-piece.bottom {
+    top: calc(var(--row-h) * 1.5);
+    transform: translate(-50%, -50%);
   }
   .row {
     display: flex;

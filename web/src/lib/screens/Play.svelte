@@ -96,6 +96,7 @@
     ranked: RankedTurnDto[] | null; // alternative moves with evaluations (human moves)
     isHuman: boolean; // whether this was the human's move (replayable)
     cube?: boolean; // true → a cube action (double / take / pass / beaver), not a checker move
+    cubeDec?: CubeDecisionDto | null; // engine's cube recommendation for this turn (cube variants)
   };
   let history = $state<LogEntry[]>([]);
   let reviewIdx = $state<number | null>(null); // which log entry is expanded for review
@@ -1380,6 +1381,16 @@
           /* eval is best-effort */
         }
       }
+      // the engine's cube recommendation for this turn's pre-move position (still
+      // the mover's, dice-independent) — recorded for per-move review of cube play
+      let cubeAdvice: CubeDecisionDto | null = null;
+      if (hasCube) {
+        try {
+          cubeAdvice = await engine.cubeDecision();
+        } catch {
+          /* cube hint is best-effort */
+        }
+      }
       const before = pos;
       pos = await engine.applyTurn(id);
       if (before) lastCells = changedCells(before, pos);
@@ -1396,6 +1407,7 @@
             before: beforeSnap,
             ranked: rankedAll,
             isHuman: wasHuman,
+            cubeDec: cubeAdvice,
           },
         ];
       }
@@ -1465,6 +1477,16 @@
     const d2 = preset ? preset[1] : rollDie();
     if (!preset) recordRoll('opp', d1, d2); // preset = opening, already recorded
     const before = pos;
+    // the engine's cube recommendation for this turn (its own pre-roll position),
+    // recorded for per-move review just like the human's
+    let cubeAdvice: CubeDecisionDto | null = null;
+    if (hasCube) {
+      try {
+        cubeAdvice = await engine.cubeDecision();
+      } catch {
+        /* cube hint is best-effort */
+      }
+    }
     await engine.setDice(d1, d2);
     pos = await engine.getPosition(); // reflect the dice on the board first
     const beforeSnap = pos ? snap(pos) : null;
@@ -1489,6 +1511,7 @@
           before: beforeSnap,
           ranked: null,
           isHuman: false,
+          cubeDec: cubeAdvice,
         },
       ];
     }
@@ -1655,6 +1678,7 @@
       lastCells={viewing ? [] : lastCells}
       glide={viewing ? null : glide}
       canRoll={phase === 'humanRoll' && !viewing}
+      showCube={hasCube}
       {bearOffCell}
       {boardStyle}
       center={boardCenter}
@@ -2056,6 +2080,14 @@
                 </button>
                 {#if reviewIdx === i}
                   <div class="review">
+                    {#if hasCube && h.cubeDec}
+                      <div class="cube-advice {h.cubeDec.action}">
+                        <span class="ca-cap">🎲² куб:</span>
+                        <strong>{h.cubeDec.note}</strong>
+                        <span class="ca-eq">эквити {fmtEq(h.cubeDec.equity)}</span>
+                        {#if h.cubeDec.recommend_beaver}<span class="ca-beaver">бивер!</span>{/if}
+                      </div>
+                    {/if}
                     {#if h.cube}
                       <div class="review-head">Действие с кубом — запись для листа партии.</div>
                     {:else if h.ranked && h.ranked.length}
@@ -3356,6 +3388,54 @@
     font: 600 0.78rem system-ui;
     color: #a08a6a;
     margin-bottom: 0.35rem;
+  }
+  /* the engine's cube recommendation for this turn (review of doubling decisions) */
+  .cube-advice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.45rem;
+    font-size: 0.82rem;
+    color: #3a2e1c;
+    padding: 0.3rem 0.5rem;
+    margin-bottom: 0.45rem;
+    background: #f3ead8;
+    border-radius: 6px;
+    border-left: 3px solid #c9b48a;
+  }
+  .cube-advice .ca-cap {
+    color: #8a6a2a;
+    font-weight: 600;
+  }
+  .cube-advice strong {
+    color: #5a4220;
+  }
+  /* tint the recommendation by action, matching the live cube hint */
+  .cube-advice.too_good {
+    border-left-color: #c22;
+  }
+  .cube-advice.too_good strong {
+    color: #b22;
+  }
+  .cube-advice.double_pass {
+    border-left-color: #b80;
+  }
+  .cube-advice.double_pass strong {
+    color: #b80;
+  }
+  .cube-advice.double_take {
+    border-left-color: #2a6;
+  }
+  .cube-advice.double_take strong {
+    color: #2a6;
+  }
+  .cube-advice .ca-eq {
+    color: #9a8a6a;
+    font-variant-numeric: var(--num-tabular);
+  }
+  .cube-advice .ca-beaver {
+    color: #c22;
+    font-weight: 700;
   }
   .review-acts {
     display: flex;

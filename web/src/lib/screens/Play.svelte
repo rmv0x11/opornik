@@ -108,6 +108,10 @@
   let viewPast = $state<{ game: number; h: LogEntry } | null>(null);
   const viewing = $derived(viewIdx != null ? (history[viewIdx] ?? null) : (viewPast?.h ?? null));
   const viewPos = $derived(viewing?.before ?? null);
+  // The game sheet lists the newest move on top (reverse-chronological, like the
+  // dice «Последовательность» panel). We keep each entry's ORIGINAL index so the
+  // review/replay/view handlers still address the right history row.
+  const historyView = $derived(history.map((h, i) => ({ h, i })).reverse());
   function closeView() {
     viewIdx = null;
     viewPast = null;
@@ -137,10 +141,14 @@
   let soundOn = $state(loadPref('opornik.sound', true)); // synthesized sound effects
   // auto-commit: a fully built move plays itself — no «Подтвердить ход» click
   let autoCommit = $state(loadPref('opornik.autoCommit', false));
+  // move hints: highlight which checkers can move and where; off = play with no
+  // on-board prompts (the engine still validates moves either way)
+  let showHints = $state(loadPref('opornik.hints', true));
   $effect(() => savePref('opornik.barOpen', barOpen));
   $effect(() => savePref('opornik.analysisOpen', analysisOpen));
   $effect(() => savePref('opornik.autoRoll', autoRoll));
   $effect(() => savePref('opornik.autoCommit', autoCommit));
+  $effect(() => savePref('opornik.hints', showHints));
   $effect(() => {
     savePref('opornik.sound', soundOn);
     setSoundEnabled(soundOn);
@@ -358,7 +366,7 @@
     viewIdx = idx;
     setTimeout(() => {
       document
-        .querySelector(`.gamelog .log li:nth-child(${idx + 1})`)
+        .querySelector(`.gamelog .log li[data-idx="${idx}"]`)
         ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }, 30);
   }
@@ -1676,6 +1684,7 @@
       dests={viewing ? [] : destCells}
       selected={viewing || selSource == null ? null : phys(humanColor, selSource)}
       lastCells={viewing ? [] : lastCells}
+      {showHints}
       glide={viewing ? null : glide}
       canRoll={phase === 'humanRoll' && !viewing}
       showCube={hasCube}
@@ -1719,6 +1728,14 @@
           onclick={() => (soundOn = !soundOn)}
           title="Звуковые эффекты"
         >{soundOn ? '🔊' : '🔇'} звук</button>
+        <button
+          type="button"
+          class="auto-toggle"
+          class:on={showHints}
+          aria-pressed={showHints}
+          onclick={() => (showHints = !showHints)}
+          title="Подсвечивать ходы на доске — какие шашки можно двигать и куда"
+        >💡 подсказки{showHints ? ' ✓' : ''}</button>
       </div>
       {#if hasCube}
         <div class="cube-state">🎲² Куб: <strong>{pos.cube.value}</strong> ({cubeOwnerDesc(pos)})</div>
@@ -2051,8 +2068,8 @@
           </div>
           {#if logOpen}
           <ol class="log">
-            {#each history as h, i}
-              <li>
+            {#each historyView as { h, i } (i)}
+              <li data-idx={i}>
                 <button
                   type="button"
                   class="logrow {sev(h.loss)}"

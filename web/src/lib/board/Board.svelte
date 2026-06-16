@@ -11,6 +11,7 @@
     dests = [],
     selected = null,
     lastCells = [],
+    showHints = true,
     glide = null,
     canRoll = false,
     showCube = false,
@@ -30,6 +31,7 @@
     dests?: number[];
     selected?: number | null;
     lastCells?: number[]; // physical cells touched by the most recent move (pulse)
+    showHints?: boolean; // draw the move hints (movable checkers + destination dots); the sets still drive interaction when off
     glide?: { from: number; to: number; color: PlayerColor; bearOff?: boolean } | null; // fly a piece (point→point, or point→tray on bear-off)
     canRoll?: boolean; // show a clickable roll prompt in the centre
     showCube?: boolean; // render the doubling cube on the board (cube variants only)
@@ -242,7 +244,7 @@
         type="button"
         class="point up"
         class:dark={slot % 2 === 0}
-        class:source={sourceSet.has(cell)}
+        class:source={showHints && sourceSet.has(cell)}
         class:dest={destSet.has(cell)}
         class:selected={selected === cell}
         class:last={lastSet.has(cell)}
@@ -251,7 +253,7 @@
       >
         <span class="tri"></span>
         <span class="ptnum up">{posOfPhys(orientation, cell)}</span>
-        {#if destSet.has(cell)}<span class="dot"></span>{/if}
+        {#if showHints && destSet.has(cell)}<span class="dot"></span>{/if}
         <span class="stack down">
           {#if c.color}
             {#each Array(discs(c.count)) as _}
@@ -273,7 +275,7 @@
         type="button"
         class="point down"
         class:dark={slot % 2 === 0}
-        class:source={sourceSet.has(cell)}
+        class:source={showHints && sourceSet.has(cell)}
         class:dest={destSet.has(cell)}
         class:selected={selected === cell}
         class:last={lastSet.has(cell)}
@@ -282,7 +284,7 @@
       >
         <span class="tri"></span>
         <span class="ptnum down">{posOfPhys(orientation, cell)}</span>
-        {#if destSet.has(cell)}<span class="dot"></span>{/if}
+        {#if showHints && destSet.has(cell)}<span class="dot"></span>{/if}
         <span class="stack up">
           {#if c.color}
             {#each Array(discs(c.count)) as _}

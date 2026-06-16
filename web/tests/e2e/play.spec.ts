@@ -772,6 +772,58 @@ test('opening roll: higher die goes first; the game becomes playable', async ({ 
   await expect(page.locator('.board .checker').first()).toBeVisible();
 });
 
+test('game sheet lists the newest move on top (reverse-chronological)', async ({ page }) => {
+  await startAndRoll(page);
+  // play a couple of full rounds so the sheet holds several rows with rising
+  // turn numbers
+  for (let r = 0; r < 2; r++) {
+    await makeHumanMove(page);
+    await waitIdle(page);
+    const roll = page.getByRole('button', { name: /Бросить кости/ });
+    if (!(await roll.isVisible().catch(() => false))) break;
+    await roll.click();
+    await page.locator('.board .point.source').first().waitFor({ timeout: 40_000 }).catch(() => {});
+  }
+  const lns = (await page.locator('.gamelog .logrow .ln').allTextContents())
+    .map((t) => Number(t.trim()))
+    .filter((n) => Number.isFinite(n));
+  expect(lns.length, 'the sheet should have several rows').toBeGreaterThan(1);
+  // newest on top ⇒ the move numbers run high→low down the list
+  for (let i = 1; i < lns.length; i++) {
+    expect(lns[i - 1], `row ${i - 1} (${lns[i - 1]}) should be ≥ row ${i} (${lns[i]})`).toBeGreaterThanOrEqual(
+      lns[i],
+    );
+  }
+  expect(lns[0], 'the top row is the latest move').toBeGreaterThan(lns[lns.length - 1]);
+});
+
+test('подсказки toggle hides the on-board move highlights but leaves play working', async ({
+  page,
+}) => {
+  await startAndRoll(page);
+  // hints are on by default: movable checkers (source) are highlighted
+  await expect(page.locator('.board .point.source').first()).toBeVisible();
+  const cell = await page.locator('.board .point.source').first().getAttribute('data-cell');
+  expect(cell).not.toBeNull();
+
+  // turn подсказки OFF → no source highlight, no destination dots
+  await page.getByRole('button', { name: /подсказки/ }).click();
+  await expect(page.locator('.board .point.source')).toHaveCount(0);
+  await expect(page.locator('.board .dot')).toHaveCount(0);
+
+  // interaction is unaffected — clicking the (now un-highlighted) checker still
+  // selects it, and its destinations stay hidden while hints are off
+  await page.locator(`.board .point[data-cell="${cell}"]`).click();
+  await expect(page.locator('.board .point.selected')).toHaveCount(1);
+  await expect(page.locator('.board .dot')).toHaveCount(0);
+
+  // turn подсказки back ON → the highlights return (the selected piece now shows
+  // its destination dots again)
+  await page.getByRole('button', { name: /подсказки/ }).click();
+  await expect(page.locator('.board .point.source').first()).toBeVisible();
+  await expect(page.locator('.board .dot').first()).toBeVisible();
+});
+
 // ---------------------------------------------------------------------------
 // Mobile layout usability: the game log must scroll INTERNALLY and the page must
 // NOT scroll (regression guard for v0.9.6→0.9.7, where a <details> flex container
